@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import threading
 from typing import List
 from urllib.parse import urlencode
@@ -15,6 +16,93 @@ from app.utils import utils
 # Thread-safe counter for API key rotation
 _api_key_counter = 0
 _api_key_lock = threading.Lock()
+
+# -----------------------------------------------------------------------------
+# Relevance guard / 素材相关性兜底
+#
+# Stock-footage search engines (Pexels/Pixabay) do loose, per-word fuzzy
+# matching, not literal AND matching. A query like "octopus intelligence" can
+# return robot/chess videos because "intelligence" alone matched, even though
+# "octopus" was in the query. Putting the subject word in the search query is
+# not enough - the *results* must be checked too. Pexels doesn't expose tags
+# for videos, but its page URL (e.g. ".../octopus-gliding-over-ocean-floor-123/")
+# is an auto-generated descriptive slug we can check. Pixabay exposes real tags.
+# -----------------------------------------------------------------------------
+
+_SUBJECT_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "of", "in", "on", "at", "to", "for", "and", "or", "with",
+        "about", "facts", "fact", "surprising", "amazing", "top", "best", "things",
+        "thing", "how", "why", "what", "is", "are", "video", "short", "reel",
+    }
+)
+
+
+def _extract_subject_keywords(video_subject: str) -> List[str]:
+    words = re.findall(r"[A-Za-z]+", (video_subject or "").lower())
+    keywords = [
+        w for w in words if w not in _SUBJECT_STOPWORDS and not w.isdigit() and len(w) > 2
+    ]
+    return keywords or words
+
+
+def _singular_forms(word: str) -> List[str]:
+    forms = [word]
+    if word.endswith("es") and len(word) > 4:
+        forms.append(word[:-2])
+    if word.endswith("s") and len(word) > 3:
+        forms.append(word[:-1])
+    return forms
+
+
+def _text_matches_subject(text: str, subject_keywords: List[str]) -> bool:
+    text_lower = (text or "").lower()
+    return any(
+        form in text_lower
+        for keyword in subject_keywords
+        for form in _singular_forms(keyword)
+    )
+
+
+def _filter_items_by_subject(
+    items: List[MaterialInfo],
+    metadata_texts: List[str],
+    video_subject: str,
+    provider_name: str,
+) -> List[MaterialInfo]:
+    """
+    只保留素材元数据（Pexels 页面 URL / Pixabay tags 等）中真正出现主体关键词的
+    结果，丢弃仅靠搜索引擎模糊匹配到的不相关素材。如果没有可判断的主体关键词
+    （比如极短或纯符号的主题），则不过滤，避免误伤正常流程。
+    """
+    subject_keywords = _extract_subject_keywords(video_subject)
+    if not subject_keywords:
+        return items
+
+    # 如果该 provider 对这批结果完全没有提供可用的元数据文本（比如 Coverr 响应
+    # 里没有 title 字段），就不过滤——宁可保留可能不完全相关的结果，也不要因为
+    # 元数据缺失而把所有素材都判定为不相关。
+    if not any((text or "").strip() for text in metadata_texts):
+        logger.warning(
+            f"{provider_name}: no relevance metadata available in results, "
+            "skipping subject filter for this batch"
+        )
+        return items
+
+    kept = []
+    dropped = 0
+    for item, text in zip(items, metadata_texts):
+        if _text_matches_subject(text, subject_keywords):
+            kept.append(item)
+        else:
+            dropped += 1
+
+    if dropped:
+        logger.info(
+            f"{provider_name}: dropped {dropped}/{len(items)} results whose metadata "
+            f"did not mention the video subject ({subject_keywords})"
+        )
+    return kept
 
 
 def _get_tls_verify() -> bool:
@@ -56,6 +144,7 @@ def search_videos_pexels(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
+    video_subject: str = "",
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
     video_orientation = aspect.name
@@ -80,6 +169,7 @@ def search_videos_pexels(
         )
         response = r.json()
         video_items = []
+        item_page_urls: List[str] = []
         if "videos" not in response:
             logger.error(f"search videos failed: {response}")
             return video_items
@@ -101,8 +191,14 @@ def search_videos_pexels(
                     item.url = video["link"]
                     item.duration = duration
                     video_items.append(item)
+                    # Pexels page URLs are auto-generated descriptive slugs, e.g.
+                    # ".../octopus-gliding-over-ocean-floor-underwater-32199586/".
+                    # This is the only relevance signal Pexels' video API exposes.
+                    item_page_urls.append(v.get("url", ""))
                     break
-        return video_items
+        return _filter_items_by_subject(
+            video_items, item_page_urls, video_subject, "pexels"
+        )
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
 
@@ -113,6 +209,7 @@ def search_videos_pixabay(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
+    video_subject: str = "",
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
 
@@ -135,6 +232,7 @@ def search_videos_pixabay(
         )
         response = r.json()
         video_items = []
+        item_tags: List[str] = []
         if "hits" not in response:
             logger.error(f"search videos failed: {response}")
             return video_items
@@ -157,8 +255,10 @@ def search_videos_pixabay(
                     item.url = video["url"]
                     item.duration = duration
                     video_items.append(item)
+                    # Pixabay exposes real contributor tags, e.g. "ocean, octopus, reef".
+                    item_tags.append(v.get("tags", ""))
                     break
-        return video_items
+        return _filter_items_by_subject(video_items, item_tags, video_subject, "pixabay")
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
 
@@ -169,6 +269,7 @@ def search_videos_coverr(
     search_term: str,
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
+    video_subject: str = "",
 ) -> List[MaterialInfo]:
     """
     Coverr (https://coverr.co) - free HD/4K stock videos,
@@ -210,6 +311,7 @@ def search_videos_coverr(
         )
         response = r.json()
         video_items: List[MaterialInfo] = []
+        item_titles: List[str] = []
 
         if not isinstance(response, dict) or "hits" not in response:
             logger.error(f"search videos failed: {response}")
@@ -234,7 +336,8 @@ def search_videos_coverr(
             item.url = mp4_download_url
             item.duration = duration
             video_items.append(item)
-        return video_items
+            item_titles.append(v.get("title", ""))
+        return _filter_items_by_subject(video_items, item_titles, video_subject, "coverr")
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
 
@@ -310,6 +413,7 @@ def download_videos(
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
     match_script_order: bool = False,
+    video_subject: str = "",
 ) -> List[str]:
     search_videos = search_videos_pexels
     if source == "pixabay":
@@ -332,6 +436,7 @@ def download_videos(
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
+            video_subject=video_subject,
         )
 
     valid_video_items = []
@@ -342,6 +447,7 @@ def download_videos(
             search_term=search_term,
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
+            video_subject=video_subject,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
 
@@ -391,6 +497,7 @@ def _download_videos_by_script_order(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    video_subject: str = "",
 ) -> List[str]:
     """
     按脚本文案顺序下载素材。
@@ -411,6 +518,7 @@ def _download_videos_by_script_order(
             search_term=search_term,
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
+            video_subject=video_subject,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
 

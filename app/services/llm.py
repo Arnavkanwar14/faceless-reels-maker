@@ -12,6 +12,70 @@ from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
 
 _max_retries = 5
+# Small stopword list used to extract the significant/subject words from a video
+# subject string (e.g. "5 surprising facts about octopuses" -> {"octopuses"}).
+_SUBJECT_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "of", "in", "on", "at", "to", "for", "and", "or", "with",
+        "about", "facts", "fact", "surprising", "amazing", "top", "best", "things",
+        "thing", "how", "why", "what", "is", "are", "video", "short", "reel",
+    }
+)
+
+
+def _extract_subject_keywords(video_subject: str) -> List[str]:
+    """提取视频主题中的实义词，用于校验/强制搜索词包含真正的主体名词。"""
+    words = re.findall(r"[A-Za-z]+", video_subject.lower())
+    keywords = [
+        w for w in words if w not in _SUBJECT_STOPWORDS and not w.isdigit() and len(w) > 2
+    ]
+    return keywords or words
+
+
+def _singular_forms(word: str) -> List[str]:
+    """返回一个词的常见单复数变体，用于宽松匹配（如 octopuses -> octopus）。"""
+    forms = [word]
+    if word.endswith("es") and len(word) > 4:
+        forms.append(word[:-2])
+    if word.endswith("s") and len(word) > 3:
+        forms.append(word[:-1])
+    return forms
+
+
+def _term_contains_subject(term: str, subject_keywords: List[str]) -> bool:
+    """粗略匹配（含单复数）判断搜索词是否包含主体关键词，而不仅仅是抽象概念词。"""
+    term_lower = term.lower()
+    for keyword in subject_keywords:
+        if any(form in term_lower for form in _singular_forms(keyword)):
+            return True
+    return False
+
+
+def _enforce_subject_in_terms(
+    search_terms: List[str], video_subject: str
+) -> List[str]:
+    """
+    防御性兜底：无论 LLM 是否遵守 prompt 约束，都强制每个搜索词包含视频主体的
+    实义词，避免抽象概念词（如 "intelligence"、"behavior"）在 Pexels/Pixabay
+    的字面关键词搜索中匹配到完全无关的素材（机器人、棋类等）。
+    """
+    if not search_terms:
+        return search_terms
+
+    subject_keywords = _extract_subject_keywords(video_subject)
+    if not subject_keywords:
+        return search_terms
+
+    primary_subject = subject_keywords[-1]
+    fixed_terms = []
+    for term in search_terms:
+        if not isinstance(term, str) or not term.strip():
+            continue
+        if _term_contains_subject(term, subject_keywords):
+            fixed_terms.append(term)
+        else:
+            fixed_terms.append(f"{primary_subject} {term}".strip())
+    return fixed_terms
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
@@ -624,9 +688,18 @@ def generate_terms(
 
 ## Constrains:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
+2. each search term should consist of 1-3 words, and EVERY term must literally contain
+   the main subject noun of the video (e.g. if the subject is "octopuses", every term
+   must contain the word "octopus" or "octopuses" - not just relate to it conceptually).
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
-4. the search terms must be related to the subject of the video.
+4. the search terms must describe a CONCRETE, PHYSICALLY FILMABLE scene or object -
+   these terms are fed directly into a literal stock-footage keyword search (Pexels/Pixabay),
+   which has no semantic understanding. Abstract or conceptual words (e.g. "intelligence",
+   "behavior", "communication", "strategy") frequently match unrelated stock footage
+   (robots, chess, business meetings) because the search engine matches on that word alone.
+   Bad: "Octopus Intelligence", "Octopus Behavior", "Octopus Communication".
+   Good: "Octopus Underwater", "Octopus Tentacles Closeup", "Octopus Camouflage Rock",
+   "Octopus Swimming Ocean".
 5. reply with english search terms only.
 {ordering_rule}
 
@@ -677,6 +750,14 @@ Please note that you must use English for generating video search terms; Chinese
             break
         if i < _max_retries:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
+
+    original_terms = list(search_terms)
+    search_terms = _enforce_subject_in_terms(search_terms, video_subject)
+    if search_terms != original_terms:
+        logger.warning(
+            "some generated search terms did not contain the video subject; "
+            f"rewrote them for relevance: {original_terms} -> {search_terms}"
+        )
 
     logger.success(f"completed: \n{search_terms}")
     return search_terms
