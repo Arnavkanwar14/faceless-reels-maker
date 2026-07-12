@@ -24,7 +24,20 @@ _SUBJECT_STOPWORDS = frozenset(
 
 
 def _extract_subject_keywords(video_subject: str) -> List[str]:
-    """提取视频主题中的实义词，用于校验/强制搜索词包含真正的主体名词。"""
+    """提取视频主题中的实义词，用于校验/强制搜索词包含真正的主体名词。
+
+    优先使用主题原文中的专有名词（大写词），它们通常才是真正的主体（人名/
+    品牌名），比"controversy"、"reaction"这类泛化话题词更能代表相关性——
+    否则任意两个人吵架的素材都能靠"controversy"混过滤器。
+    """
+    proper_nouns = re.findall(r"\b[A-Z][a-zA-Z]+\b", video_subject or "")
+    proper_nouns = [
+        w.lower() for w in proper_nouns
+        if w.lower() not in _SUBJECT_STOPWORDS and len(w) > 2
+    ]
+    if proper_nouns:
+        return proper_nouns
+
     words = re.findall(r"[A-Za-z]+", video_subject.lower())
     keywords = [
         w for w in words if w not in _SUBJECT_STOPWORDS and not w.isdigit() and len(w) > 2
@@ -51,6 +64,17 @@ def _term_contains_subject(term: str, subject_keywords: List[str]) -> bool:
     return False
 
 
+def _looks_like_named_person_subject(video_subject: str) -> bool:
+    """检测主题是否围绕一个具体真实姓名（如 "Samay Raina"）展开。
+
+    连续两个及以上大写开头的词通常是人名模式。这种主题下，通用素材库根本
+    不可能有这个人的真实画面——强制在每个搜索词里塞入他的名字只会让每个
+    查询都返回 0 个结果。此时应放行主题化的场景词（棋盘、直播设备、社媒
+    通知等），而不是死守字面姓名匹配。
+    """
+    return bool(re.search(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b", video_subject or ""))
+
+
 def _enforce_subject_in_terms(
     search_terms: List[str], video_subject: str
 ) -> List[str]:
@@ -58,8 +82,13 @@ def _enforce_subject_in_terms(
     防御性兜底：无论 LLM 是否遵守 prompt 约束，都强制每个搜索词包含视频主体的
     实义词，避免抽象概念词（如 "intelligence"、"behavior"）在 Pexels/Pixabay
     的字面关键词搜索中匹配到完全无关的素材（机器人、棋类等）。
+
+    主题是具体真实姓名时跳过这层强制——见 _looks_like_named_person_subject。
     """
     if not search_terms:
+        return search_terms
+
+    if _looks_like_named_person_subject(video_subject):
         return search_terms
 
     subject_keywords = _extract_subject_keywords(video_subject)
@@ -701,6 +730,18 @@ def generate_terms(
    Good: "Octopus Underwater", "Octopus Tentacles Closeup", "Octopus Camouflage Rock",
    "Octopus Swimming Ocean".
 5. reply with english search terms only.
+6. if the subject is about a specific real, named individual (a public figure,
+   streamer, YouTuber, celebrity, etc.), do NOT search for their literal name -
+   general stock-footage libraries (Pexels/Pixabay) do not carry footage of
+   specific real people and a name-based search will return zero or wrong
+   results. Instead, generate terms for generic footage that matches the
+   THEME/SETTING of the story: their content niche (e.g. "chess board closeup",
+   "esports gaming setup" for a gaming/chess streamer), the medium (e.g.
+   "youtube interface screen", "person streaming laptop", "webcam recording
+   setup"), and the emotional tone of the story (e.g. "social media backlash",
+   "phone notifications", "crowd reaction booing", "breaking news text" for a
+   controversy). These terms must still each contain a concrete noun from this
+   list, not abstract words alone.
 {ordering_rule}
 
 ## Output Example:

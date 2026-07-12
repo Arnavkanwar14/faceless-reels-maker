@@ -39,6 +39,21 @@ _SUBJECT_STOPWORDS = frozenset(
 
 
 def _extract_subject_keywords(video_subject: str) -> List[str]:
+    # Prefer proper-noun words (capitalized in the original subject) when present.
+    # These are usually the actual named person/entity/brand the topic is about,
+    # and are a far more reliable relevance anchor than generic topic words like
+    # "controversy" or "reaction" - a clip of two random people arguing will
+    # match "controversy" just fine without having anything to do with the
+    # actual subject. Falling back to those generic words as the *only* anchor
+    # lets clearly wrong footage pass the filter.
+    proper_nouns = re.findall(r"\b[A-Z][a-zA-Z]+\b", video_subject or "")
+    proper_nouns = [
+        w.lower() for w in proper_nouns
+        if w.lower() not in _SUBJECT_STOPWORDS and len(w) > 2
+    ]
+    if proper_nouns:
+        return proper_nouns
+
     words = re.findall(r"[A-Za-z]+", (video_subject or "").lower())
     keywords = [
         w for w in words if w not in _SUBJECT_STOPWORDS and not w.isdigit() and len(w) > 2
@@ -64,6 +79,17 @@ def _text_matches_subject(text: str, subject_keywords: List[str]) -> bool:
     )
 
 
+def _looks_like_named_person_subject(video_subject: str) -> bool:
+    """检测主题是否围绕一个具体真实姓名展开——见 llm.py 中的同名函数。
+
+    这两份实现故意保持独立（不做跨模块依赖），但逻辑必须一致：命中时，
+    通用素材库不可能有这个人的真实画面，要求结果元数据里出现他的名字只会
+    把所有候选素材过滤成 0 个，所以直接跳过这层过滤，交给更精确的搜索词
+    本身（含具体名词要求）来保证相关性。
+    """
+    return bool(re.search(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b", video_subject or ""))
+
+
 def _filter_items_by_subject(
     items: List[MaterialInfo],
     metadata_texts: List[str],
@@ -75,6 +101,9 @@ def _filter_items_by_subject(
     结果，丢弃仅靠搜索引擎模糊匹配到的不相关素材。如果没有可判断的主体关键词
     （比如极短或纯符号的主题），则不过滤，避免误伤正常流程。
     """
+    if _looks_like_named_person_subject(video_subject):
+        return items
+
     subject_keywords = _extract_subject_keywords(video_subject)
     if not subject_keywords:
         return items

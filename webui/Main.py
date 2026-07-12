@@ -2180,7 +2180,7 @@ def _render_video_settings(panel, params):
             params.video_clip_duration = stable_selectbox(
                 tr("Clip Duration"),
                 options=[2, 3, 4, 5, 6, 7, 8, 9, 10],
-                default_value=3,
+                default_value=5,
                 key="video_clip_duration_select",
                 help=tr("Clip Duration Help"),
             )
@@ -3174,6 +3174,13 @@ def _render_generation_controls(
         finally:
             _remove_active_generation_task(task_id)
             remove_logger_handler_safely(log_handler_id)
+
+        # tm.start() blocks the script for the whole generation run, during
+        # which the Task Manager fragment (rendered earlier in this same
+        # script pass, at the top of the page) cannot re-execute and pick up
+        # the just-completed task. A full rerun here refreshes it without
+        # requiring the user to manually reload the page.
+        st.rerun(scope="app")
 
     render_generation_logs(log_container)
 
