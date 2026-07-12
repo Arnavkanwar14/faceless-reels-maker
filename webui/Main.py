@@ -3160,8 +3160,17 @@ def _render_generation_controls(
             logger.info(tr("Start Generating Video"))
             logger.info(utils.to_json(params))
 
-            with config.runtime_config_lock():
-                result = tm.start(task_id=task_id, params=params)
+            # 不要用 runtime_config_lock 包住整个生成过程：这把锁是全局的
+            # threading.RLock，_SynchronizedConfig 的每次写操作（包括页面
+            # 正常渲染时几乎必然执行的 config.app["video_source"] = ... 这类
+            # 赋值）都要抢它。生成一次视频可能持续好几分钟，锁被占用期间，
+            # 任何刷新页面或打开新标签页的会话只要渲染到一次 config 写入就
+            # 会卡死，直到这次生成完成——用户实际遇到的“重新加载后本地页面
+            # 卡住，得强制刷新才能看到进度”正是这个原因。这把锁本来是为了
+            # 防止另一个标签页在生成过程中中途切换 Provider/密钥，但配置的
+            # 读取（.get()）本来就不受这把锁保护，真正需要保护的窗口很短，
+            # 不值得为此让整个 WebUI 在生成期间对其它会话失去响应。
+            result = tm.start(task_id=task_id, params=params)
             if not result or "videos" not in result:
                 st.error(tr("Video Generation Failed"))
                 logger.error(tr("Video Generation Failed"))
