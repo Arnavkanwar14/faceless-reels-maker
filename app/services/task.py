@@ -44,7 +44,7 @@ def generate_script(task_id, params):
     return video_script
 
 
-def generate_terms(task_id, params, video_script):
+def generate_terms(task_id, params, video_script, video_source=None, subject_classification=None):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
     if not video_terms:
@@ -56,7 +56,8 @@ def generate_terms(task_id, params, video_script):
             video_script=video_script,
             amount=8 if params.match_materials_to_script else 5,
             match_script_order=params.match_materials_to_script,
-            video_source=params.video_source,
+            video_source=video_source if video_source is not None else params.video_source,
+            subject_classification=subject_classification,
         )
     else:
         if isinstance(video_terms, str):
@@ -243,8 +244,15 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
-    if params.video_source == "local":
+def get_video_materials(
+    task_id, params, video_terms, audio_duration, video_source=None, is_named_person=None
+):
+    # video_source 覆盖参数用于虚构主题的自动切换：task.start() 检测到主题
+    # 虚构时，只想临时改变"这次去哪里找素材"，不想连带覆盖 params.video_source
+    # 本身——那个字段还要用于任务恢复/展示用户原始选择的素材来源。
+    effective_source = video_source if video_source is not None else params.video_source
+
+    if effective_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
             materials=params.video_materials, clip_duration=params.video_clip_duration
@@ -256,7 +264,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             )
             return None
         return [material_info.url for material_info in materials]
-    elif params.video_source == "ai_visuals":
+    elif effective_source == "ai_visuals":
         logger.info("\n\n## generating AI visual clips (no real-world footage available)")
         downloaded_videos = ai_visuals.generate_ai_visual_clips(
             task_id=task_id,
@@ -270,7 +278,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             logger.error("failed to generate AI visual clips.")
             return None
         return downloaded_videos
-    elif params.video_source == "youtube":
+    elif effective_source == "youtube":
         # 下载他人在 YouTube 上发布的真实内容片段，用于素材库里根本不存在的
         # 具体真实人物/事件画面。这类素材本质上是他人版权内容，只截取短片段
         # 不改变这一点——用户已经在选择这个来源时明确接受相应风险。
@@ -291,13 +299,13 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             return None
         return downloaded_videos
     else:
-        logger.info(f"\n\n## downloading videos from {params.video_source}")
+        logger.info(f"\n\n## downloading videos from {effective_source}")
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
         # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
         downloaded_videos = material.download_videos(
             task_id=task_id,
             search_terms=video_terms,
-            source=params.video_source,
+            source=effective_source,
             video_aspect=params.video_aspect,
             video_concat_mode=(
                 VideoConcatMode.sequential
@@ -308,6 +316,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             max_clip_duration=params.video_clip_duration,
             match_script_order=params.match_materials_to_script,
             video_subject=params.video_subject,
+            is_named_person=is_named_person,
         )
         if not downloaded_videos:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -427,16 +436,22 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
 
-    # 素材库（Pexels/Pixabay/YouTube）都不可能有虚构对象的实拍画面：与其继续
-    # 搜索返回空结果或无关素材，不如提前切换到 AI 图像生成路径。只在自动
-    # 素材来源下生效，不覆盖用户显式上传的本地素材。
-    if params.video_source != "local" and llm.is_fictional_subject(params.video_subject):
-        logger.info(
-            f"subject '{params.video_subject}' looks fictional/has no real-world "
-            f"footage available; switching video source from "
-            f"'{params.video_source}' to AI-generated visuals"
-        )
-        params.video_source = "ai_visuals"
+    # 一次 LLM 调用同时判断：主题是否虚构、是否围绕一个真实姓名展开、核心
+    # 主体词是什么。素材库（Pexels/Pixabay/YouTube）都不可能有虚构对象的
+    # 实拍画面，与其继续搜索返回空结果或无关素材，不如提前切换到 AI 图像
+    # 生成路径。这里只算出一个"本次实际使用的来源"，不改写 params.video_source
+    # 本身——那个字段要留给任务恢复/展示用户当初的原始选择使用。
+    subject_classification = None
+    effective_video_source = params.video_source
+    if params.video_source != "local":
+        subject_classification = llm.classify_subject(params.video_subject)
+        if subject_classification["is_fictional"]:
+            logger.info(
+                f"subject '{params.video_subject}' looks fictional/has no real-world "
+                f"footage available; using AI-generated visuals for this run "
+                f"(original selection: '{params.video_source}')"
+            )
+            effective_video_source = "ai_visuals"
 
     if stop_at == "script":
         sm.state.update_task(
@@ -447,7 +462,13 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     # 2. Generate terms
     video_terms = ""
     if params.video_source != "local":
-        video_terms = generate_terms(task_id, params, video_script)
+        video_terms = generate_terms(
+            task_id,
+            params,
+            video_script,
+            video_source=effective_video_source,
+            subject_classification=subject_classification,
+        )
         if not video_terms:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             return
@@ -499,7 +520,12 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration
+        task_id,
+        params,
+        video_terms,
+        audio_duration,
+        video_source=effective_video_source,
+        is_named_person=(subject_classification or {}).get("is_named_person"),
     )
     if not downloaded_videos:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)

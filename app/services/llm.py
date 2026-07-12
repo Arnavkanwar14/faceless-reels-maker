@@ -76,7 +76,11 @@ def _looks_like_named_person_subject(video_subject: str) -> bool:
 
 
 def _enforce_subject_in_terms(
-    search_terms: List[str], video_subject: str, video_source: str = "pexels"
+    search_terms: List[str],
+    video_subject: str,
+    video_source: str = "pexels",
+    is_named_person: bool | None = None,
+    subject_noun: str | None = None,
 ) -> List[str]:
     """
     防御性兜底：无论 LLM 是否遵守 prompt 约束，都强制每个搜索词包含视频主体的
@@ -84,20 +88,27 @@ def _enforce_subject_in_terms(
     的字面关键词搜索中匹配到完全无关的素材（机器人、棋类等）。
 
     主题是具体真实姓名时，仅在非 YouTube 来源下跳过这层强制——见
-    _looks_like_named_person_subject。YouTube 恰恰相反，需要真实姓名才能找到
-    这个人的真实画面。
+    classify_subject。YouTube 恰恰相反，需要真实姓名才能找到这个人的真实画面。
+
+    is_named_person / subject_noun 由调用方传入 classify_subject() 的结果时
+    直接使用（更准确）；不传时才退回正则/关键词启发式，保持向后兼容。
     """
     if not search_terms:
         return search_terms
 
-    if video_source != "youtube" and _looks_like_named_person_subject(video_subject):
+    named_person = (
+        is_named_person
+        if is_named_person is not None
+        else _looks_like_named_person_subject(video_subject)
+    )
+    if video_source != "youtube" and named_person:
         return search_terms
 
     subject_keywords = _extract_subject_keywords(video_subject)
     if not subject_keywords:
         return search_terms
 
-    primary_subject = subject_keywords[-1]
+    primary_subject = subject_noun or _fallback_subject_noun(video_subject)
     fixed_terms = []
     for term in search_terms:
         if not isinstance(term, str) or not term.strip():
@@ -107,6 +118,8 @@ def _enforce_subject_in_terms(
         else:
             fixed_terms.append(f"{primary_subject} {term}".strip())
     return fixed_terms
+
+
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
@@ -683,6 +696,7 @@ def generate_terms(
     amount: int = 5,
     match_script_order: bool = False,
     video_source: str = "pexels",
+    subject_classification: dict | None = None,
 ) -> List[str]:
     if video_source == "youtube":
         # YouTube 搜索的目标恰恰相反：这里就是要找到真人真事的实拍画面，所以
@@ -811,7 +825,13 @@ Please note that you must use English for generating video search terms; Chinese
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
 
     original_terms = list(search_terms)
-    search_terms = _enforce_subject_in_terms(search_terms, video_subject, video_source)
+    search_terms = _enforce_subject_in_terms(
+        search_terms,
+        video_subject,
+        video_source,
+        is_named_person=(subject_classification or {}).get("is_named_person"),
+        subject_noun=(subject_classification or {}).get("subject_noun"),
+    )
     if search_terms != original_terms:
         logger.warning(
             "some generated search terms did not contain the video subject; "
@@ -823,43 +843,83 @@ Please note that you must use English for generating video search terms; Chinese
 
 
 # =============================================================================
-# Fictional-subject detection
+# Subject classification
 #
-# 判断视频主题是否围绕一个真实世界不存在实拍画面的对象展开（虚构角色、
-# 游戏/动画 IP、品牌吉祥物等）。这类主题下 Pexels/Pixabay/YouTube 都不可能
-# 有对应素材，继续走真实素材搜索只会返回不相关内容或者空结果；应该改用
-# AI 图像生成 + Ken Burns 运镜代替真实视频素材。
+# 一次 LLM 调用回答三件事：主题是否虚构（无真实世界画面可能）、是否围绕一个
+# 具体真实姓名展开、以及主体核心名词/名字是什么。
+#
+# 这里把原本分散的两个判断合并成一次调用，而不是各自单独调用一次 LLM：
+# 1. 虚构判断（原 is_fictional_subject）：Pexels/Pixabay/YouTube 都不可能有
+#    虚构角色的真实画面，需要改用 AI 图像生成。
+# 2. 真实姓名判断（原 _looks_like_named_person_subject 的正则版本）：正则
+#    "连续两个大写词" 对 "Deep Ocean Creatures"、"Ancient Roman Empire" 这类
+#    普通 Title Case 话题一样会误判，错误地跳过相关性过滤/关键词强制。
+# 3. subject_noun：直接把"这条视频真正的主体是什么"问出来，而不是用
+#    "关键词列表最后一个词"这种启发式去猜——后者在 "octopus behavior in the
+#    wild" 这类主题上会选中 "wild" 而不是 "octopus"。
+#
+# LLM 调用失败时三个字段都退化到原来的正则/启发式实现，保证离线或 LLM 报错
+# 时功能仍然可用，只是精度回退。
 # =============================================================================
 
 
-def is_fictional_subject(video_subject: str) -> bool:
-    """用一次轻量 LLM 调用判断主题是否为虚构/无实拍画面可能的对象。"""
+def classify_subject(video_subject: str) -> dict:
+    """返回 {"is_fictional": bool, "is_named_person": bool, "subject_noun": str}。"""
+    fallback = {
+        "is_fictional": False,
+        "is_named_person": _looks_like_named_person_subject(video_subject),
+        "subject_noun": _fallback_subject_noun(video_subject),
+    }
+
     if not video_subject or not video_subject.strip():
-        return False
+        return fallback
 
     prompt = f"""
-Does the following video subject reference a FICTIONAL character, creature, \
-franchise IP, or brand mascot that has NO real-world photographic or video \
-footage available anywhere (e.g. a video game character, an anime/cartoon \
-character, a Pokemon, a fictional creature, a brand mascot)?
+Analyze this video subject and answer three questions:
 
-Answer with exactly one word: "yes" or "no".
+1. is_fictional: does it reference a FICTIONAL character, creature, franchise \
+IP, or brand mascot that has NO real-world photographic or video footage \
+available anywhere (e.g. a video game character, an anime/cartoon character, \
+a Pokemon, a fictional creature, a brand mascot)?
+2. is_named_person: is it specifically about one real, named individual (a \
+public figure, streamer, YouTuber, celebrity)? Answer false for generic \
+topics even if phrased with capitalized words (e.g. "Deep Ocean Creatures", \
+"Ancient Roman Empire" are NOT about a named person).
+3. subject_noun: what is the single core subject noun or name of this video? \
+(e.g. "octopus" for "octopus behavior in the wild", "Samay Raina" for \
+"controversy on YouTuber Samay Raina", "Pikachu" for "Pikachu explains \
+electricity")
+
+Respond with ONLY a json object, nothing else:
+{{"is_fictional": true|false, "is_named_person": true|false, "subject_noun": "..."}}
 
 Video subject: {video_subject}
 """.strip()
 
     try:
         response = _generate_response(prompt)
+        if "Error: " in response:
+            logger.warning(f"subject classification failed, using fallback: {response}")
+            return fallback
+        parsed = json.loads(_strip_code_fence(response))
+        if not isinstance(parsed, dict):
+            raise ValueError("response is not a json object")
+        return {
+            "is_fictional": bool(parsed.get("is_fictional", fallback["is_fictional"])),
+            "is_named_person": bool(parsed.get("is_named_person", fallback["is_named_person"])),
+            "subject_noun": str(parsed.get("subject_noun") or fallback["subject_noun"]).strip()
+            or fallback["subject_noun"],
+        }
     except Exception as e:
-        logger.warning(f"fictional-subject detection failed, assuming real-world: {e}")
-        return False
+        logger.warning(f"subject classification failed, using fallback: {e}")
+        return fallback
 
-    if "Error: " in response:
-        logger.warning(f"fictional-subject detection failed, assuming real-world: {response}")
-        return False
 
-    normalized = response.strip().lower()
-    return normalized.startswith("yes")
+def _fallback_subject_noun(video_subject: str) -> str:
+    """classify_subject 调用失败时的兜底主体词——优先专有名词，否则拼接全部
+    关键词而不是猜一个，避免重蹈 "选中 wild 而不是 octopus" 的覆辙。"""
+    keywords = _extract_subject_keywords(video_subject)
+    return " ".join(keywords) if keywords else (video_subject or "").strip()
 
 
 # =============================================================================

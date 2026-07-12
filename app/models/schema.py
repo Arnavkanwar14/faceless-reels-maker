@@ -179,6 +179,7 @@ class VideoTermsParams:
     )
     amount: Optional[int] = 5
     match_materials_to_script: bool = False
+    video_source: Optional[str] = "pexels"
 
 
 class VideoSocialMetadataParams:

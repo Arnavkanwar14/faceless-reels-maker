@@ -95,13 +95,23 @@ def _filter_items_by_subject(
     metadata_texts: List[str],
     video_subject: str,
     provider_name: str,
+    is_named_person: bool | None = None,
 ) -> List[MaterialInfo]:
     """
     只保留素材元数据（Pexels 页面 URL / Pixabay tags 等）中真正出现主体关键词的
     结果，丢弃仅靠搜索引擎模糊匹配到的不相关素材。如果没有可判断的主体关键词
     （比如极短或纯符号的主题），则不过滤，避免误伤正常流程。
+
+    is_named_person 由调用方传入 llm.classify_subject() 的结果时直接使用
+    （更准确，避免正则对 "Deep Ocean Creatures" 这类普通 Title Case 话题误判）；
+    不传时才退回本地正则启发式，保持向后兼容。
     """
-    if _looks_like_named_person_subject(video_subject):
+    named_person = (
+        is_named_person
+        if is_named_person is not None
+        else _looks_like_named_person_subject(video_subject)
+    )
+    if named_person:
         return items
 
     subject_keywords = _extract_subject_keywords(video_subject)
@@ -174,6 +184,7 @@ def search_videos_pexels(
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_subject: str = "",
+    is_named_person: bool | None = None,
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
     video_orientation = aspect.name
@@ -226,7 +237,7 @@ def search_videos_pexels(
                     item_page_urls.append(v.get("url", ""))
                     break
         return _filter_items_by_subject(
-            video_items, item_page_urls, video_subject, "pexels"
+            video_items, item_page_urls, video_subject, "pexels", is_named_person
         )
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
@@ -239,6 +250,7 @@ def search_videos_pixabay(
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_subject: str = "",
+    is_named_person: bool | None = None,
 ) -> List[MaterialInfo]:
     aspect = VideoAspect(video_aspect)
 
@@ -287,7 +299,9 @@ def search_videos_pixabay(
                     # Pixabay exposes real contributor tags, e.g. "ocean, octopus, reef".
                     item_tags.append(v.get("tags", ""))
                     break
-        return _filter_items_by_subject(video_items, item_tags, video_subject, "pixabay")
+        return _filter_items_by_subject(
+            video_items, item_tags, video_subject, "pixabay", is_named_person
+        )
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
 
@@ -299,6 +313,7 @@ def search_videos_coverr(
     minimum_duration: int,
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_subject: str = "",
+    is_named_person: bool | None = None,
 ) -> List[MaterialInfo]:
     """
     Coverr (https://coverr.co) - free HD/4K stock videos,
@@ -366,7 +381,9 @@ def search_videos_coverr(
             item.duration = duration
             video_items.append(item)
             item_titles.append(v.get("title", ""))
-        return _filter_items_by_subject(video_items, item_titles, video_subject, "coverr")
+        return _filter_items_by_subject(
+            video_items, item_titles, video_subject, "coverr", is_named_person
+        )
     except Exception as e:
         logger.error(f"search videos failed: {str(e)}")
 
@@ -572,6 +589,7 @@ def download_videos(
     max_clip_duration: int = 5,
     match_script_order: bool = False,
     video_subject: str = "",
+    is_named_person: bool | None = None,
 ) -> List[str]:
     search_videos = search_videos_pexels
     if source == "pixabay":
@@ -595,6 +613,7 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
             video_subject=video_subject,
+            is_named_person=is_named_person,
         )
 
     valid_video_items = []
@@ -606,6 +625,7 @@ def download_videos(
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
             video_subject=video_subject,
+            is_named_person=is_named_person,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
 
@@ -656,6 +676,7 @@ def _download_videos_by_script_order(
     max_clip_duration: int,
     material_directory: str,
     video_subject: str = "",
+    is_named_person: bool | None = None,
 ) -> List[str]:
     """
     按脚本文案顺序下载素材。
@@ -677,6 +698,7 @@ def _download_videos_by_script_order(
             minimum_duration=max_clip_duration,
             video_aspect=video_aspect,
             video_subject=video_subject,
+            is_named_person=is_named_person,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
 
