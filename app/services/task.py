@@ -8,7 +8,16 @@ from loguru import logger
 from app.config import config
 from app.models import const
 from app.models.schema import VideoConcatMode, VideoParams
-from app.services import llm, material, subtitle, twelvelabs, video, voice, upload_post
+from app.services import (
+    ai_visuals,
+    llm,
+    material,
+    subtitle,
+    twelvelabs,
+    video,
+    voice,
+    upload_post,
+)
 from app.services import state as sm
 from app.utils import file_security, utils
 
@@ -47,6 +56,7 @@ def generate_terms(task_id, params, video_script):
             video_script=video_script,
             amount=8 if params.match_materials_to_script else 5,
             match_script_order=params.match_materials_to_script,
+            video_source=params.video_source,
         )
     else:
         if isinstance(video_terms, str):
@@ -246,6 +256,40 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             )
             return None
         return [material_info.url for material_info in materials]
+    elif params.video_source == "ai_visuals":
+        logger.info("\n\n## generating AI visual clips (no real-world footage available)")
+        downloaded_videos = ai_visuals.generate_ai_visual_clips(
+            task_id=task_id,
+            search_terms=video_terms,
+            video_subject=params.video_subject,
+            video_aspect=params.video_aspect,
+            max_clip_duration=params.video_clip_duration,
+        )
+        if not downloaded_videos:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error("failed to generate AI visual clips.")
+            return None
+        return downloaded_videos
+    elif params.video_source == "youtube":
+        # 下载他人在 YouTube 上发布的真实内容片段，用于素材库里根本不存在的
+        # 具体真实人物/事件画面。这类素材本质上是他人版权内容，只截取短片段
+        # 不改变这一点——用户已经在选择这个来源时明确接受相应风险。
+        logger.info("\n\n## downloading video clips from YouTube")
+        downloaded_videos = material.download_youtube_videos(
+            task_id=task_id,
+            search_terms=video_terms,
+            video_subject=params.video_subject,
+            audio_duration=audio_duration * params.video_count,
+            max_clip_duration=params.video_clip_duration,
+        )
+        if not downloaded_videos:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error(
+                "failed to find relevant YouTube clips for this subject. "
+                "Try a different/more specific video subject."
+            )
+            return None
+        return downloaded_videos
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
@@ -341,6 +385,17 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         return
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=10)
+
+    # 素材库（Pexels/Pixabay/YouTube）都不可能有虚构对象的实拍画面：与其继续
+    # 搜索返回空结果或无关素材，不如提前切换到 AI 图像生成路径。只在自动
+    # 素材来源下生效，不覆盖用户显式上传的本地素材。
+    if params.video_source != "local" and llm.is_fictional_subject(params.video_subject):
+        logger.info(
+            f"subject '{params.video_subject}' looks fictional/has no real-world "
+            f"footage available; switching video source from "
+            f"'{params.video_source}' to AI-generated visuals"
+        )
+        params.video_source = "ai_visuals"
 
     if stop_at == "script":
         sm.state.update_task(

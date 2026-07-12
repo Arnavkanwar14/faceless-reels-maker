@@ -373,6 +373,135 @@ def search_videos_coverr(
     return []
 
 
+def search_and_download_youtube_clip(
+    search_term: str,
+    minimum_duration: int,
+    max_clip_duration: int,
+    video_subject: str,
+    output_dir: str,
+) -> str:
+    """
+    在 YouTube 上搜索与 search_term 相关的视频，下载其中一小段作为素材。
+
+    与 Pexels/Pixabay 不同：这里的目标就是找到真实拍到主体本人/事件的视频，
+    所以标题相关性过滤是必须的，不能跳过（跳过会退化成随便下一个热门视频）。
+    只下载一小段而不是整条视频，减小体积、降低使用风险，但不改变这类素材
+    本质上是他人版权内容这一事实——调用方必须已经确认接受这一点。
+    """
+    import yt_dlp
+
+    subject_keywords = _extract_subject_keywords(video_subject)
+
+    search_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "default_search": "ytsearch8",
+    }
+    try:
+        with yt_dlp.YoutubeDL(search_opts) as ydl:
+            info = ydl.extract_info(search_term, download=False)
+            entries = (info or {}).get("entries") or []
+    except Exception as e:
+        logger.error(f"youtube search failed for '{search_term}': {e}")
+        return ""
+
+    candidates = []
+    for entry in entries:
+        if not entry:
+            continue
+        title = entry.get("title") or ""
+        duration = entry.get("duration") or 0
+        video_id = entry.get("id")
+        if not video_id or duration < minimum_duration:
+            continue
+        if subject_keywords and not _text_matches_subject(title, subject_keywords):
+            continue
+        candidates.append((video_id, title, duration))
+
+    if not candidates:
+        logger.info(
+            f"youtube: no title-relevant results for '{search_term}' "
+            f"(subject keywords: {subject_keywords})"
+        )
+        return ""
+
+    video_id, title, duration = candidates[0]
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+    # 跳过大概率是片头的开场部分，从视频中段附近截取一小段。
+    start = min(20, max(0, duration // 4))
+    end = min(duration, start + max_clip_duration)
+    if end - start < minimum_duration:
+        start = 0
+        end = min(duration, max_clip_duration)
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"yt-{utils.md5(f'{video_id}-{start}')}.mp4")
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        return output_path
+
+    download_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "best[height<=1920][ext=mp4]/best[ext=mp4]/best",
+        "outtmpl": output_path,
+        "download_ranges": yt_dlp.utils.download_range_func(None, [(start, end)]),
+        "force_keyframes_at_cuts": True,
+        "ffmpeg_location": utils.get_ffmpeg_binary(),
+    }
+    try:
+        with yt_dlp.YoutubeDL(download_opts) as ydl:
+            ydl.download([video_url])
+    except Exception as e:
+        logger.error(f"youtube clip download failed for '{video_url}': {e}")
+        return ""
+
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        logger.info(
+            f"youtube: downloaded clip from '{title}' ({start}s-{end}s) for '{search_term}'"
+        )
+        return output_path
+    return ""
+
+
+def download_youtube_videos(
+    task_id: str,
+    search_terms: List[str],
+    video_subject: str,
+    audio_duration: float = 0.0,
+    max_clip_duration: int = 5,
+    material_directory: str = "",
+) -> List[str]:
+    """按搜索词逐个在 YouTube 上找相关素材，直到覆盖音频时长或用完关键词。"""
+    output_dir = material_directory or utils.storage_dir("cache_videos")
+
+    video_paths = []
+    total_duration = 0.0
+    for search_term in search_terms:
+        clip_path = search_and_download_youtube_clip(
+            search_term=search_term,
+            minimum_duration=max_clip_duration,
+            max_clip_duration=max_clip_duration,
+            video_subject=video_subject,
+            output_dir=output_dir,
+        )
+        if not clip_path:
+            continue
+        video_paths.append(clip_path)
+        total_duration += max_clip_duration
+        if total_duration > audio_duration:
+            logger.info(
+                f"total duration of downloaded youtube clips: {total_duration} seconds, "
+                "skip downloading more"
+            )
+            break
+
+    logger.success(f"downloaded {len(video_paths)} youtube clips")
+    return video_paths
+
+
 def save_video(video_url: str, save_dir: str = "") -> str:
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")

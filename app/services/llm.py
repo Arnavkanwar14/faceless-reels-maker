@@ -76,19 +76,21 @@ def _looks_like_named_person_subject(video_subject: str) -> bool:
 
 
 def _enforce_subject_in_terms(
-    search_terms: List[str], video_subject: str
+    search_terms: List[str], video_subject: str, video_source: str = "pexels"
 ) -> List[str]:
     """
     防御性兜底：无论 LLM 是否遵守 prompt 约束，都强制每个搜索词包含视频主体的
     实义词，避免抽象概念词（如 "intelligence"、"behavior"）在 Pexels/Pixabay
     的字面关键词搜索中匹配到完全无关的素材（机器人、棋类等）。
 
-    主题是具体真实姓名时跳过这层强制——见 _looks_like_named_person_subject。
+    主题是具体真实姓名时，仅在非 YouTube 来源下跳过这层强制——见
+    _looks_like_named_person_subject。YouTube 恰恰相反，需要真实姓名才能找到
+    这个人的真实画面。
     """
     if not search_terms:
         return search_terms
 
-    if _looks_like_named_person_subject(video_subject):
+    if video_source != "youtube" and _looks_like_named_person_subject(video_subject):
         return search_terms
 
     subject_keywords = _extract_subject_keywords(video_subject)
@@ -680,7 +682,34 @@ def generate_terms(
     video_script: str,
     amount: int = 5,
     match_script_order: bool = False,
+    video_source: str = "pexels",
 ) -> List[str]:
+    if video_source == "youtube":
+        # YouTube 搜索的目标恰恰相反：这里就是要找到真人真事的实拍画面，所以
+        # 必须直接用真实姓名搜索，而不是像 Pexels/Pixabay 那样避开它。
+        named_person_rule = (
+            "6. if the subject is about a specific real, named individual, EVERY "
+            "term must include their actual name combined with a relevant angle "
+            '(e.g. "Samay Raina controversy", "Samay Raina chess", "Samay Raina '
+            'apology") - these terms are searched directly on YouTube, which does '
+            "carry real footage of real people, unlike generic stock libraries."
+        )
+    else:
+        named_person_rule = (
+            "6. if the subject is about a specific real, named individual (a public figure,\n"
+            "   streamer, YouTuber, celebrity, etc.), do NOT search for their literal name -\n"
+            "   general stock-footage libraries (Pexels/Pixabay) do not carry footage of\n"
+            "   specific real people and a name-based search will return zero or wrong\n"
+            "   results. Instead, generate terms for generic footage that matches the\n"
+            '   THEME/SETTING of the story: their content niche (e.g. "chess board closeup",\n'
+            '   "esports gaming setup" for a gaming/chess streamer), the medium (e.g.\n'
+            '   "youtube interface screen", "person streaming laptop", "webcam recording\n'
+            '   setup"), and the emotional tone of the story (e.g. "social media backlash",\n'
+            '   "phone notifications", "crowd reaction booing", "breaking news text" for a\n'
+            "   controversy). These terms must still each contain a concrete noun from this\n"
+            "   list, not abstract words alone."
+        )
+
     if match_script_order:
         goal = (
             f"Generate {amount} chronological stock-video search terms that follow "
@@ -730,18 +759,7 @@ def generate_terms(
    Good: "Octopus Underwater", "Octopus Tentacles Closeup", "Octopus Camouflage Rock",
    "Octopus Swimming Ocean".
 5. reply with english search terms only.
-6. if the subject is about a specific real, named individual (a public figure,
-   streamer, YouTuber, celebrity, etc.), do NOT search for their literal name -
-   general stock-footage libraries (Pexels/Pixabay) do not carry footage of
-   specific real people and a name-based search will return zero or wrong
-   results. Instead, generate terms for generic footage that matches the
-   THEME/SETTING of the story: their content niche (e.g. "chess board closeup",
-   "esports gaming setup" for a gaming/chess streamer), the medium (e.g.
-   "youtube interface screen", "person streaming laptop", "webcam recording
-   setup"), and the emotional tone of the story (e.g. "social media backlash",
-   "phone notifications", "crowd reaction booing", "breaking news text" for a
-   controversy). These terms must still each contain a concrete noun from this
-   list, not abstract words alone.
+{named_person_rule}
 {ordering_rule}
 
 ## Output Example:
@@ -793,7 +811,7 @@ Please note that you must use English for generating video search terms; Chinese
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
 
     original_terms = list(search_terms)
-    search_terms = _enforce_subject_in_terms(search_terms, video_subject)
+    search_terms = _enforce_subject_in_terms(search_terms, video_subject, video_source)
     if search_terms != original_terms:
         logger.warning(
             "some generated search terms did not contain the video subject; "
@@ -802,6 +820,46 @@ Please note that you must use English for generating video search terms; Chinese
 
     logger.success(f"completed: \n{search_terms}")
     return search_terms
+
+
+# =============================================================================
+# Fictional-subject detection
+#
+# 判断视频主题是否围绕一个真实世界不存在实拍画面的对象展开（虚构角色、
+# 游戏/动画 IP、品牌吉祥物等）。这类主题下 Pexels/Pixabay/YouTube 都不可能
+# 有对应素材，继续走真实素材搜索只会返回不相关内容或者空结果；应该改用
+# AI 图像生成 + Ken Burns 运镜代替真实视频素材。
+# =============================================================================
+
+
+def is_fictional_subject(video_subject: str) -> bool:
+    """用一次轻量 LLM 调用判断主题是否为虚构/无实拍画面可能的对象。"""
+    if not video_subject or not video_subject.strip():
+        return False
+
+    prompt = f"""
+Does the following video subject reference a FICTIONAL character, creature, \
+franchise IP, or brand mascot that has NO real-world photographic or video \
+footage available anywhere (e.g. a video game character, an anime/cartoon \
+character, a Pokemon, a fictional creature, a brand mascot)?
+
+Answer with exactly one word: "yes" or "no".
+
+Video subject: {video_subject}
+""".strip()
+
+    try:
+        response = _generate_response(prompt)
+    except Exception as e:
+        logger.warning(f"fictional-subject detection failed, assuming real-world: {e}")
+        return False
+
+    if "Error: " in response:
+        logger.warning(f"fictional-subject detection failed, assuming real-world: {response}")
+        return False
+
+    normalized = response.strip().lower()
+    return normalized.startswith("yes")
 
 
 # =============================================================================

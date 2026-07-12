@@ -2021,6 +2021,7 @@ def _render_script_settings(panel, params):
                                 script,
                                 amount=8 if params.match_materials_to_script else 5,
                                 match_script_order=params.match_materials_to_script,
+                                video_source=params.video_source,
                             )
                         if "Error: " in script:
                             st.error(tr(script))
@@ -2054,6 +2055,7 @@ def _render_script_settings(panel, params):
                                 params.video_script,
                                 amount=8 if params.match_materials_to_script else 5,
                                 match_script_order=params.match_materials_to_script,
+                                video_source=params.video_source,
                             )
                         if "Error: " in terms:
                             st.error(tr(terms))
@@ -2081,6 +2083,7 @@ def _render_video_settings(panel, params):
                 (tr("Pexels"), "pexels"),
                 (tr("Pixabay"), "pixabay"),
                 (tr("Coverr"), "coverr"),
+                (tr("YouTube (copyright risk)"), "youtube"),
                 (tr("Local file"), "local"),
             ]
 
@@ -2096,6 +2099,14 @@ def _render_video_settings(panel, params):
                 )[value],
             )
             config.app["video_source"] = params.video_source
+
+            if params.video_source == "youtube":
+                st.warning(
+                    "YouTube clips are other creators' copyrighted content. "
+                    "Downloading short segments doesn't remove that fact. "
+                    "Using them in a published/monetized video is a real "
+                    "Content-ID/copyright risk you are choosing to accept."
+                )
 
             if params.video_source == "local":
                 # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
