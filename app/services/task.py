@@ -318,6 +318,38 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return downloaded_videos
 
 
+def _verify_video_file(video_path: str) -> bool:
+    """
+    渲染流程之前只检查 ffmpeg/moviepy 写出过程是否报错，从不检查产物本身
+    事后是否可读。exit code 0 加文件存在，不代表容器已经完整落盘——我们已经
+    不止一次在渲染进行中途亲眼看到 "moov atom not found"：文件已经创建、
+    体积在增长，但索引还没写完。这里强制重新打开一次产物文件，读取时长，
+    读不出来就说明文件还不能被播放器正常打开，不能当作成功产物返回给用户。
+
+    复用 VideoFileClip（而不是自己再去猜 ffprobe 二进制路径）是为了和
+    video.py 里其它素材校验逻辑保持同一套探测方式。
+    """
+    if not video_path or not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+        logger.error(f"video file missing or empty: {video_path}")
+        return False
+
+    clip = None
+    try:
+        clip = video._open_video_clip_quietly(video_path)
+        duration = clip.duration
+    except Exception as exc:
+        logger.error(f"video file failed integrity check: {video_path}, error: {exc}")
+        return False
+    finally:
+        video.close_clip(clip)
+
+    if not duration or duration <= 0:
+        logger.error(f"video file has no readable duration: {video_path}")
+        return False
+
+    return True
+
+
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path
 ):
@@ -364,6 +396,15 @@ def generate_final_videos(
             output_file=final_video_path,
             params=params,
         )
+
+        if not _verify_video_file(final_video_path):
+            # 不要把打不开的文件当成功产物交出去——宁可这一路视频直接失败，
+            # 也不要让用户看到进度 100% 却打不开文件。
+            logger.error(
+                f"video {index} failed post-render integrity check, "
+                "not returning it as a successful output"
+            )
+            continue
 
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
