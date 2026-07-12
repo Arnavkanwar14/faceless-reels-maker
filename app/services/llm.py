@@ -104,16 +104,23 @@ def _enforce_subject_in_terms(
     if video_source != "youtube" and named_person:
         return search_terms
 
-    subject_keywords = _extract_subject_keywords(video_subject)
-    if not subject_keywords:
+    # subject_noun 存在时只用它做"是否已经相关"的判定，不再退回
+    # _extract_subject_keywords 拆出的全部实义词——那份列表里 "science"、
+    # "erupt" 这类词单独出现也会被判定为"已经相关"，导致完全不沾边的素材
+    # 混进来（例如 "the science of how volcanoes erupt" 下，一个只提到
+    # "science" 的无关素材会被当作合格结果）。
+    primary_subject = subject_noun or _fallback_subject_noun(video_subject)
+    required_keywords = [primary_subject] if subject_noun else _extract_subject_keywords(
+        video_subject
+    )
+    if not required_keywords:
         return search_terms
 
-    primary_subject = subject_noun or _fallback_subject_noun(video_subject)
     fixed_terms = []
     for term in search_terms:
         if not isinstance(term, str) or not term.strip():
             continue
-        if _term_contains_subject(term, subject_keywords):
+        if _term_contains_subject(term, required_keywords):
             fixed_terms.append(term)
         else:
             fixed_terms.append(f"{primary_subject} {term}".strip())

@@ -245,7 +245,13 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 
 
 def get_video_materials(
-    task_id, params, video_terms, audio_duration, video_source=None, is_named_person=None
+    task_id,
+    params,
+    video_terms,
+    audio_duration,
+    video_source=None,
+    is_named_person=None,
+    subject_noun=None,
 ):
     # video_source 覆盖参数用于虚构主题的自动切换：task.start() 检测到主题
     # 虚构时，只想临时改变"这次去哪里找素材"，不想连带覆盖 params.video_source
@@ -317,6 +323,7 @@ def get_video_materials(
             match_script_order=params.match_materials_to_script,
             video_subject=params.video_subject,
             is_named_person=is_named_person,
+            subject_noun=subject_noun,
         )
         if not downloaded_videos:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -526,6 +533,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         audio_duration,
         video_source=effective_video_source,
         is_named_person=(subject_classification or {}).get("is_named_person"),
+        subject_noun=(subject_classification or {}).get("subject_noun"),
     )
     if not downloaded_videos:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
