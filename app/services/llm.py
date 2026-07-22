@@ -23,6 +23,46 @@ _SUBJECT_STOPWORDS = frozenset(
 )
 
 
+_LIST_COUNT_WORDS = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "twenty": 20,
+}
+_LIST_SUBJECT_RE = re.compile(
+    r"\b(\d{1,2}|" + "|".join(_LIST_COUNT_WORDS) + r")\s+"
+    r"(things?|reasons?|ways?|facts?|secrets?|mistakes?|signs?|tips?|"
+    r"myths?|lies?|rules?|steps?|hacks?|tricks?)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_list_subject(video_subject: str) -> tuple[int, str] | None:
+    """检测视频主题里是否包含一个明确的数量承诺（"5 things X"、"top 3
+    reasons Y" 这类），如果有，返回 (数量, 匹配到的短语)。
+
+    这类主题对脚本结构是硬约束：主题本身承诺了具体条数，脚本正文必须
+    真的一条一条讲完，而不是笼统概括主题、把"这些秘密"塞进结尾一两句
+    话里含糊带过。仅靠通用 prompt 规则容易被模型忽略，这里额外提取出
+    具体数字，动态拼进 prompt，让约束落到这次生成的具体条数上。
+    """
+    match = _LIST_SUBJECT_RE.search(video_subject or "")
+    if not match:
+        return None
+
+    count_text = match.group(1).lower()
+    count = _LIST_COUNT_WORDS.get(count_text)
+    if count is None:
+        try:
+            count = int(count_text)
+        except ValueError:
+            return None
+
+    if not (2 <= count <= 20):
+        return None
+
+    return count, match.group(0)
+
+
 def _extract_subject_keywords(video_subject: str) -> List[str]:
     """提取视频主题中的实义词，用于校验/强制搜索词包含真正的主体名词。
 
@@ -101,7 +141,7 @@ def _enforce_subject_in_terms(
         if is_named_person is not None
         else _looks_like_named_person_subject(video_subject)
     )
-    if video_source != "youtube" and named_person:
+    if video_source not in ("youtube", "real_images") and named_person:
         return search_terms
 
     # subject_noun 存在时只用它做"是否已经相关"的判定，不再退回
@@ -169,6 +209,28 @@ read like an article or a lecture.
 4. Prefer concrete numbers, vivid comparisons, and surprising specifics
    over vague generalities throughout - specificity is what holds
    attention, not adjectives.
+5. If the subject itself promises a specific count of items ("5 things
+   X hid from us", "top 3 reasons Y failed", "7 mistakes everyone
+   makes"), that count is a contract with the viewer, not a suggestion.
+   The BODY must actually name and develop every single one of those
+   items as its own distinct beat with a concrete detail or example -
+   never summarize the general topic instead, and never gesture at "the
+   hidden things" or "these secrets" as a vague mention crammed into the
+   last few seconds without ever stating what they are. The enumerated
+   items ARE the body of the script, not an afterthought at the end of
+   generic background/context about the topic.
+6. FACTUAL GROUNDING - never invent or assert specific facts (character
+   names, cast, dates, plot points, quotes, statistics) about real
+   people, ongoing productions, or current events unless those facts are
+   explicitly present in the "Verified Context" or "Additional User
+   Requirements" sections below. Your training data is not a reliable
+   source for recent or breaking topics - guessing "the obvious names"
+   to sound specific is worse than being general, because it states
+   fabricated claims as confirmed fact. If the subject implies something
+   specific (e.g. "all heroes confirmed") and you have no verified
+   context to draw from, either omit the specifics entirely or frame
+   them explicitly as unconfirmed/rumored - never present a guess as
+   settled fact.
 
 ## Constrains:
 1. the script is to be returned as a string with the specified number of paragraphs.
@@ -594,12 +656,51 @@ def _normalize_script_paragraph_number(paragraph_number: int | None) -> int:
     return value
 
 
+_GROUNDING_MAX_RESULTS = 5
+_GROUNDING_SNIPPET_CHARS = 220
+
+
+def fetch_grounding_context(video_subject: str) -> str:
+    """为脚本生成抓取一批真实的网页搜索结果标题/摘要，作为"这个主题实际上
+    是什么情况"的真实依据。
+
+    背景：脚本生成完全靠 LLM 参数记忆编造具体细节，对突发新闻、预告片
+    爆料这类时效性主题（比如"复联毁灭日预告确认的全部英雄"），模型压根
+    不知道真实内容，只会用训练数据里"最像的"角色名去凑——生成的是自信
+    但虚构的错误信息。这里复用项目里已经在用的 ddgs（免费、无需 key）
+    做一次真实搜索，把标题和摘要喂给模型当作必须遵守的事实依据。
+
+    搜索失败或没有结果时返回空字符串——脚本生成会退回到只靠 prompt 里
+    "不要编造未经证实的具体信息"这条规则兜底，不阻塞整条生成流程。
+    """
+    try:
+        from ddgs import DDGS
+
+        with DDGS() as ddgs:
+            results = list(ddgs.text(video_subject, max_results=_GROUNDING_MAX_RESULTS))
+    except Exception as e:
+        logger.debug(f"grounding search failed for '{video_subject}': {e}")
+        return ""
+
+    lines = []
+    for r in results or []:
+        title = (r.get("title") or "").strip()
+        body = (r.get("body") or "").strip()
+        if not title and not body:
+            continue
+        snippet = f"{title}: {body}" if body else title
+        lines.append(f"- {snippet[:_GROUNDING_SNIPPET_CHARS]}")
+
+    return "\n".join(lines)
+
+
 def build_script_prompt(
     video_subject: str,
     language: str = "",
     paragraph_number: int = 1,
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
+    grounding_context: str = "",
 ) -> str:
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
     video_script_prompt = _limit_script_text(
@@ -627,6 +728,37 @@ def build_script_prompt(
 {video_script_prompt}
 """.rstrip()
 
+    if grounding_context:
+        prompt += f"""
+
+# Verified Context (real web search results about this exact subject):
+{grounding_context}
+
+The above are real, current search results about this subject. Treat them
+as your only source of truth for specific facts, names, and details - do
+not contradict them, and do not add specific facts beyond what they
+support. If they don't cover something the subject implies, follow rule 6
+(factual grounding) rather than guessing.
+""".rstrip()
+
+    list_subject = _detect_list_subject(video_subject)
+    if list_subject:
+        count, matched_phrase = list_subject
+        prompt += f"""
+
+# CRITICAL - This subject promises exactly {count} items:
+The phrase "{matched_phrase}" is a contract with the viewer: the script
+MUST actually name and develop all {count} distinct items, each as its
+own clear beat with a specific, concrete detail - not a vague summary of
+the general topic, and not "{count} secrets/things" mentioned only once
+near the end without ever stating what they are. The {count} items ARE
+the body of the script and should occupy most of it, covered in order.
+Do not spend the script explaining general background about the subject
+and then rush through the list in the last few seconds - deliver the
+first item shortly after the hook, then move through the rest one at a
+time.
+""".rstrip()
+
     return prompt
 
 
@@ -644,12 +776,14 @@ def generate_script(
     custom_system_prompt = _limit_script_text(
         custom_system_prompt, MAX_SCRIPT_SYSTEM_PROMPT_LENGTH, "custom_system_prompt"
     )
+    grounding_context = fetch_grounding_context(video_subject)
     prompt = build_script_prompt(
         video_subject=video_subject,
         language=language,
         paragraph_number=paragraph_number,
         video_script_prompt=video_script_prompt,
         custom_system_prompt=custom_system_prompt,
+        grounding_context=grounding_context,
     )
     final_script = ""
     logger.info(
@@ -728,15 +862,17 @@ def generate_terms(
     video_source: str = "pexels",
     subject_classification: dict | None = None,
 ) -> List[str]:
-    if video_source == "youtube":
-        # YouTube 搜索的目标恰恰相反：这里就是要找到真人真事的实拍画面，所以
-        # 必须直接用真实姓名搜索，而不是像 Pexels/Pixabay 那样避开它。
+    if video_source in ("youtube", "real_images"):
+        # YouTube/真实图片搜索的目标恰恰相反：这里就是要找到真人真事的实拍
+        # 画面或照片，所以必须直接用真实姓名搜索，而不是像 Pexels/Pixabay
+        # 那样避开它。
         named_person_rule = (
             "6. if the subject is about a specific real, named individual, EVERY "
             "term must include their actual name combined with a relevant angle "
             '(e.g. "Samay Raina controversy", "Samay Raina chess", "Samay Raina '
-            'apology") - these terms are searched directly on YouTube, which does '
-            "carry real footage of real people, unlike generic stock libraries."
+            'apology") - these terms are searched directly on YouTube/web image '
+            "search, which do carry real footage/photos of real people, unlike "
+            "generic stock libraries."
         )
     else:
         named_person_rule = (

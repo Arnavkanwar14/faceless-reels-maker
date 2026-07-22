@@ -139,6 +139,39 @@ def get_mimo_voices() -> list[str]:
     return [f"mimo:{voice}-{gender}" for voice, gender in voices_with_gender]
 
 
+def get_kokoro_voices() -> list[str]:
+    """
+    获取本地 Kokoro-82M TTS 的预置音色列表（美式/英式英语）。
+
+    Kokoro 完全本地运行、免费、无需 API key，音质比 Edge TTS 更自然，
+    且能提供真实的逐词时间轴（不像大多数第三方 TTS 只能靠句子时长近似
+    估算），可以直接喂给卡拉OK弹出字幕功能。
+    """
+    voices_with_gender = [
+        ("a", "af_heart", "Female"),
+        ("a", "af_bella", "Female"),
+        ("a", "af_nicole", "Female"),
+        ("a", "af_sarah", "Female"),
+        ("a", "af_sky", "Female"),
+        ("a", "am_adam", "Male"),
+        ("a", "am_michael", "Male"),
+        ("a", "am_echo", "Male"),
+        ("a", "am_eric", "Male"),
+        ("a", "am_liam", "Male"),
+        ("a", "am_onyx", "Male"),
+        ("b", "bf_emma", "Female"),
+        ("b", "bf_isabella", "Female"),
+        ("b", "bf_alice", "Female"),
+        ("b", "bm_george", "Male"),
+        ("b", "bm_lewis", "Male"),
+        ("b", "bm_daniel", "Male"),
+    ]
+    return [
+        f"kokoro:{lang}:{voice}-{gender}"
+        for lang, voice, gender in voices_with_gender
+    ]
+
+
 def get_elevenlabs_voices(api_key: str) -> list[str]:
     if not api_key:
         return []
@@ -250,6 +283,10 @@ def is_mimo_voice(voice_name: str):
 
 def is_elevenlabs_voice(voice_name: str) -> bool:
     return (voice_name or "").startswith("elevenlabs:")
+
+
+def is_kokoro_voice(voice_name: str) -> bool:
+    return (voice_name or "").startswith("kokoro:")
 
 
 def is_chatterbox_voice(voice_name: str) -> bool:
@@ -443,6 +480,8 @@ def tts(
         else:
             logger.error(f"Invalid chatterbox voice name format: {voice_name}")
             return None
+    elif is_kokoro_voice(voice_name):
+        return kokoro_tts(text, voice_name, voice_rate, voice_file, voice_volume)
     return azure_tts_v1(text, voice_name, voice_rate, voice_file)
 
 
@@ -1359,6 +1398,107 @@ def elevenlabs_tts(
     return None
 
 
+_kokoro_pipelines: dict = {}
+
+
+def _get_kokoro_pipeline(lang_code: str):
+    """Kokoro 的 pipeline 初始化（含模型加载）比较慢，按语言代码缓存复用，
+    避免同一进程内每次合成都重新加载模型。"""
+    if lang_code not in _kokoro_pipelines:
+        from kokoro import KPipeline
+
+        _kokoro_pipelines[lang_code] = KPipeline(lang_code=lang_code, device="cpu")
+    return _kokoro_pipelines[lang_code]
+
+
+def kokoro_tts(
+    text: str,
+    voice_name: str,
+    voice_rate: float,
+    voice_file: str,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """使用本地 Kokoro-82M 模型生成语音。
+
+    格式: kokoro:<lang_code>:<voice>-Gender，例如 kokoro:a:af_heart-Female。
+
+    和其它第三方 TTS 不同，Kokoro 每个 token 都自带真实的起止时间戳
+    （不需要靠句子时长和字符数占比去近似估算），这里直接用这份数据
+    填充 sub_maker，逐词弹出字幕功能可以拿到比其它 TTS 更准确的时间轴。
+    """
+    parts = (voice_name or "").split(":")
+    if len(parts) < 3:
+        logger.error(f"Invalid kokoro voice name format: {voice_name}")
+        return None
+
+    lang_code = parts[1]
+    voice = parts[2].rsplit("-", 1)[0]
+
+    text = (text or "").strip()
+    if not text:
+        logger.error("Kokoro TTS text is empty")
+        return None
+
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        pipeline = _get_kokoro_pipeline(lang_code)
+        speed = max(0.5, min(2.0, float(voice_rate or 1.0)))
+
+        ensure_file_path_exists(voice_file)
+        sub_maker = ensure_legacy_submaker_fields(SubMaker())
+
+        sample_rate = 24000  # Kokoro 固定输出 24kHz
+        audio_chunks = []
+        cursor_seconds = 0.0
+
+        for result in pipeline(text, voice=voice, speed=speed):
+            if result.audio is None:
+                continue
+            audio_np = result.audio.numpy()
+            audio_chunks.append(audio_np)
+
+            for token in result.tokens or []:
+                word = (token.text or "").strip()
+                if not word or token.start_ts is None or token.end_ts is None:
+                    continue
+                start_100ns = int((cursor_seconds + token.start_ts) * 10000000)
+                end_100ns = int((cursor_seconds + token.end_ts) * 10000000)
+                sub_maker.subs.append(word)
+                sub_maker.offset.append((start_100ns, end_100ns))
+
+            cursor_seconds += len(audio_np) / sample_rate
+
+        if not audio_chunks:
+            logger.error("Kokoro TTS produced no audio")
+            return None
+
+        full_audio = np.concatenate(audio_chunks)
+        output_format = utils.parse_extension(voice_file) or "mp3"
+        if output_format == "wav":
+            sf.write(voice_file, full_audio, sample_rate)
+        else:
+            # soundfile 不直接写 mp3，先落到内存 WAV 再用 pydub/ffmpeg
+            # 转码，和 mimo_tts 已有的转码方式保持一致。
+            import io
+
+            from pydub import AudioSegment
+
+            _configure_pydub_ffmpeg(AudioSegment)
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, full_audio, sample_rate, format="WAV")
+            wav_buffer.seek(0)
+            audio_segment = AudioSegment.from_file(wav_buffer, format="wav")
+            audio_segment.export(voice_file, format=output_format)
+
+        logger.success(f"kokoro tts succeeded: {voice_file}")
+        return sub_maker
+    except Exception as e:
+        logger.error(f"kokoro tts failed: {str(e)}")
+        return None
+
+
 def chatterbox_tts(
     text: str,
     voice: str,
@@ -1695,6 +1835,109 @@ def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):
         _write_subtitle_items(sub_items, subtitle_file)
     except Exception as e:
         logger.error(f"failed, error: {str(e)}")
+
+
+_CJK_RANGES = (
+    (0x4E00, 0x9FFF),  # CJK unified ideographs
+    (0x3040, 0x30FF),  # Hiragana/Katakana
+    (0xAC00, 0xD7A3),  # Hangul syllables
+)
+
+
+def _is_cjk_char(ch: str) -> bool:
+    code = ord(ch)
+    return any(lo <= code <= hi for lo, hi in _CJK_RANGES)
+
+
+def _split_into_word_units(text: str) -> list[str]:
+    """把一段文本拆成卡拉OK弹出字幕用的最小展示单元。
+
+    CJK 字符本身就是独立的语义单元，逐字展示；拉丁语系等按空白分词。
+    两者混合时（如中英夹杂）各自按自己的规则拆分，不会互相影响。
+    """
+    units = []
+    buffer = ""
+    for ch in text:
+        if _is_cjk_char(ch):
+            if buffer.strip():
+                units.append(buffer.strip())
+            buffer = ""
+            units.append(ch)
+        elif ch.isspace():
+            if buffer.strip():
+                units.append(buffer.strip())
+            buffer = ""
+        else:
+            buffer += ch
+    if buffer.strip():
+        units.append(buffer.strip())
+    return units
+
+
+def extract_word_timings(sub_maker: SubMaker) -> list[tuple[str, float, float]]:
+    """从 SubMaker 提取逐词（CJK 为逐字）时间轴，用于卡拉OK式弹出字幕。
+
+    edge_tts 7.x 的 `cues` 本身就是逐词/逐字边界事件，直接使用即可。
+    其它 TTS 提供方（Azure V2、Gemini、MiMo、ElevenLabs、SiliconFlow 等）
+    没有这种细粒度边界，只能退回到按句子时长、按字符数占比近似分配——
+    展示效果依然是逐词弹出，只是每个词的具体时长是估算值而非真实边界。
+    """
+    timings: list[tuple[str, float, float]] = []
+
+    if hasattr(sub_maker, "cues") and sub_maker.cues:
+        for cue in sub_maker.cues:
+            word = unescape(cue.content).strip()
+            if not word:
+                continue
+            timings.append(
+                (word, cue.start.total_seconds(), cue.end.total_seconds())
+            )
+        return timings
+
+    legacy_offsets = getattr(sub_maker, "offset", [])
+    legacy_subs = getattr(sub_maker, "subs", [])
+    for offset, sub in zip(legacy_offsets, legacy_subs):
+        start_100ns, end_100ns = offset
+        sentence = unescape(sub).strip()
+        if not sentence:
+            continue
+
+        units = _split_into_word_units(sentence)
+        if not units:
+            continue
+
+        total_chars = sum(len(u) for u in units) or 1
+        start_sec = start_100ns / 10000000
+        end_sec = end_100ns / 10000000
+        duration = max(end_sec - start_sec, 0.01)
+
+        cursor = start_sec
+        for unit in units:
+            share = len(unit) / total_chars
+            unit_end = min(cursor + duration * share, end_sec)
+            timings.append((unit, cursor, unit_end))
+            cursor = unit_end
+
+    return timings
+
+
+def save_word_timings(sub_maker: SubMaker, words_file: str) -> bool:
+    """把逐词时间轴写成 JSON 边车文件，供 video.py 的卡拉OK字幕渲染使用。
+
+    独立于 subtitle.srt 之外保存，是因为 SRT 格式本身只能表达整句字幕；
+    这份数据只在用户开启逐词弹出字幕时才会被读取，不影响现有整句字幕流程。
+    """
+    timings = extract_word_timings(sub_maker)
+    if not timings:
+        return False
+
+    ensure_file_path_exists(words_file)
+    payload = [
+        {"word": word, "start": start, "end": end} for word, start, end in timings
+    ]
+    with open(words_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    return True
 
 
 def _get_audio_duration_from_submaker(sub_maker: SubMaker):

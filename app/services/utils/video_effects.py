@@ -40,6 +40,38 @@ def slidein_transition(clip: Clip, t: float, side: str) -> Clip:
     )
 
 
+# ZoomPunch
+def zoom_punch_transition(clip: Clip, t: float, punch_scale: float = 1.15) -> Clip:
+    """新镜头出现时的"怼镜头"效果：从放大状态快速回落到原始大小，
+    短视频剪辑里常用来强调切镜节奏，比 1 秒淡入/滑入更有冲击力。
+
+    MoviePy 的 resized()（随时间变化的缩放）叠加 cropped() 在当前版本
+    会产生逐帧尺寸错位、画面花屏；这里改用 transform() 直接对每一帧
+    做像素级缩放+居中裁剪，一步到位，不经过会出问题的组合链路。
+    """
+    import numpy as np
+    from PIL import Image
+
+    width, height = clip.size
+
+    def apply_zoom(get_frame, current_time):
+        frame = get_frame(current_time)
+        progress = min(max(current_time / max(t, 0.001), 0), 1)
+        eased = 1 - (1 - progress) ** 3  # ease-out：快速回落而不是线性
+        scale = punch_scale - (punch_scale - 1.0) * eased
+        if abs(scale - 1.0) < 1e-3:
+            return frame
+
+        new_w, new_h = max(1, round(width * scale)), max(1, round(height * scale))
+        resized = Image.fromarray(frame).resize((new_w, new_h), Image.LANCZOS)
+        left = max(0, (new_w - width) // 2)
+        top = max(0, (new_h - height) // 2)
+        cropped = resized.crop((left, top, left + width, top + height))
+        return np.asarray(cropped)
+
+    return clip.transform(apply_zoom)
+
+
 # SlideOut
 def slideout_transition(clip: Clip, t: float, side: str) -> Clip:
     width, height = clip.size

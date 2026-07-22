@@ -38,3 +38,7 @@ streamlit.log
 .codegraph
 /docs/superpowers
 .understand-anything
+
+# webui launch logs
+webui_stdout.log
+webui_stderr.log

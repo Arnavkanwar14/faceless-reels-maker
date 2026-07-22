@@ -12,9 +12,12 @@ from app.services import (
     ai_visuals,
     llm,
     material,
+    quality_gate,
+    real_images,
     subtitle,
     twelvelabs,
     video,
+    visual_gate,
     voice,
     upload_post,
 )
@@ -241,7 +244,49 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         logger.warning(f"subtitle file is invalid: {subtitle_path}")
         return ""
 
+    # 逐词弹出字幕（卡拉OK效果）需要真实的逐词时间轴，只有 TTS 阶段的
+    # sub_maker 能提供；Whisper 转写路径没有这份数据，此时逐词字幕功能
+    # 会自动不生效，仍然回退到整句字幕，不影响正常生成。
+    if sub_maker is not None:
+        words_file = path.join(utils.task_dir(task_id), "words.json")
+        voice.save_word_timings(sub_maker, words_file)
+
     return subtitle_path
+
+
+def _ai_visuals_fallback(task_id, params, video_terms, is_named_person):
+    """真实素材来源（YouTube/真实图片）找不到可用结果时的最后兜底。
+
+    默认关闭：用户明确不想要 AI 生成的画面出现在成片里，哪怕只是找不到
+    真实素材时的最后一道防线也不行。只有用户在 UI 里显式勾选"允许 AI
+    生成兜底"（params.disable_ai_visuals = False）时才会真的生成 AI 画面；
+    否则直接判定任务失败，绝不静默产出 AI 画面冒充"生成成功"。
+    """
+    if params.disable_ai_visuals:
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error(
+            "no real footage or images found for this subject, and AI-generated "
+            "visuals are disabled. Try a different/more well-known video subject, "
+            "or enable 'Allow AI-generated images as last resort' in settings."
+        )
+        return None
+
+    downloaded_videos = ai_visuals.generate_ai_visual_clips(
+        task_id=task_id,
+        search_terms=video_terms,
+        video_subject=params.video_subject,
+        video_aspect=params.video_aspect,
+        max_clip_duration=params.video_clip_duration,
+        is_named_person=is_named_person,
+    )
+    if not downloaded_videos:
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error(
+            "failed to find relevant real materials or generate AI visuals "
+            "for this subject. Try a different/more specific video subject."
+        )
+        return None
+    return downloaded_videos
 
 
 def get_video_materials(
@@ -278,31 +323,69 @@ def get_video_materials(
             video_subject=params.video_subject,
             video_aspect=params.video_aspect,
             max_clip_duration=params.video_clip_duration,
+            is_named_person=is_named_person,
         )
         if not downloaded_videos:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             logger.error("failed to generate AI visual clips.")
             return None
         return downloaded_videos
+    elif effective_source == "real_images":
+        logger.info("\n\n## sourcing real images (YouTube thumbnails / web search)")
+        downloaded_videos = real_images.download_real_image_clips(
+            task_id=task_id,
+            search_terms=video_terms,
+            video_subject=params.video_subject,
+            video_aspect=params.video_aspect,
+            audio_duration=audio_duration * params.video_count,
+            max_clip_duration=params.video_clip_duration,
+        )
+        if not downloaded_videos:
+            logger.warning(
+                "no usable real images found for this subject, "
+                "falling back to AI-generated visuals"
+            )
+            return _ai_visuals_fallback(task_id, params, video_terms, is_named_person)
+        return downloaded_videos
     elif effective_source == "youtube":
         # 下载他人在 YouTube 上发布的真实内容片段，用于素材库里根本不存在的
         # 具体真实人物/事件画面。这类素材本质上是他人版权内容，只截取短片段
         # 不改变这一点——用户已经在选择这个来源时明确接受相应风险。
         logger.info("\n\n## downloading video clips from YouTube")
+        target_duration = audio_duration * params.video_count
         downloaded_videos = material.download_youtube_videos(
             task_id=task_id,
             search_terms=video_terms,
             video_subject=params.video_subject,
-            audio_duration=audio_duration * params.video_count,
+            audio_duration=target_duration,
             max_clip_duration=params.video_clip_duration,
         )
-        if not downloaded_videos:
-            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-            logger.error(
-                "failed to find relevant YouTube clips for this subject. "
-                "Try a different/more specific video subject."
+
+        covered_duration = len(downloaded_videos) * params.video_clip_duration
+        if covered_duration < target_duration:
+            # YouTube 搜索经常因为关键词覆盖不够而凑不满音频时长；与其把已有
+            # 片段反复循环播放（观感很廉价），不如先用真实图片补足，AI 生成
+            # 留到两者都不够时再用。
+            logger.info(
+                f"youtube clips only cover {covered_duration:.1f}s of "
+                f"{target_duration:.1f}s needed, topping up with real images"
             )
-            return None
+            topup_videos = real_images.download_real_image_clips(
+                task_id=task_id,
+                search_terms=video_terms,
+                video_subject=params.video_subject,
+                video_aspect=params.video_aspect,
+                audio_duration=target_duration - covered_duration,
+                max_clip_duration=params.video_clip_duration,
+            )
+            downloaded_videos = downloaded_videos + topup_videos
+
+        if not downloaded_videos:
+            logger.warning(
+                "no usable YouTube clips or real images found for this subject, "
+                "falling back to AI-generated visuals"
+            )
+            return _ai_visuals_fallback(task_id, params, video_terms, is_named_person)
         return downloaded_videos
     else:
         logger.info(f"\n\n## downloading videos from {effective_source}")
@@ -366,6 +449,46 @@ def _verify_video_file(video_path: str) -> bool:
     return True
 
 
+_SRT_TIME_RANGE_RE = re.compile(
+    r"(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)"
+)
+
+
+def _parse_srt_time_range(time_range: str) -> tuple[float, float] | None:
+    match = _SRT_TIME_RANGE_RE.search(time_range or "")
+    if not match:
+        return None
+    h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(g) for g in match.groups())
+    start = h1 * 3600 + m1 * 60 + s1 + ms1 / 1000
+    end = h2 * 3600 + m2 * 60 + s2 + ms2 / 1000
+    return start, end
+
+
+def _get_sentence_durations(subtitle_path: str) -> list[float]:
+    """从字幕时间轴推导每句话的时长，用于让画面剪辑点落在句子边界上，
+    而不是固定间隔——这样画面切换的节奏会跟着旁白的叙事节奏走，而不是
+    和内容语义无关的定时器。
+
+    字幕文件缺失或解析失败时返回空列表，调用方据此回退到原有的固定
+    时长剪辑，不影响现有行为。
+    """
+    if not subtitle_path or not os.path.exists(subtitle_path):
+        return []
+
+    durations = []
+    for _, time_range, text in subtitle.file_to_subtitles(subtitle_path):
+        if not text.strip():
+            continue
+        parsed = _parse_srt_time_range(time_range)
+        if not parsed:
+            continue
+        start, end = parsed
+        duration = end - start
+        if duration > 0:
+            durations.append(duration)
+    return durations
+
+
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path
 ):
@@ -380,6 +503,10 @@ def generate_final_videos(
     else:
         video_concat_mode = VideoConcatMode.random
     video_transition_mode = params.video_transition_mode
+    # 有字幕时间轴就优先按句子边界剪辑，让画面切换跟着叙事节奏走；
+    # 没有字幕（禁用字幕或字幕生成失败）时为空列表，combine_videos 会
+    # 自动回退到原有的固定时长剪辑。
+    sentence_durations = _get_sentence_durations(subtitle_path)
 
     _progress = 50
     for i in range(params.video_count):
@@ -397,6 +524,7 @@ def generate_final_videos(
             video_transition_mode=video_transition_mode,
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
+            sentence_durations=sentence_durations,
         )
 
         _progress += 50 / params.video_count / 2
@@ -453,12 +581,17 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     if params.video_source != "local":
         subject_classification = llm.classify_subject(params.video_subject)
         if subject_classification["is_fictional"]:
+            # AI 生成默认关闭：虚构主题（游戏/影视角色等）改走 real_images——
+            # YouTube 缩略图和网络图片搜索通常能找到官方预告片截图、剧照等
+            # 真实画面，比让免费图像模型凭空"想象"这些角色好得多。只有用户
+            # 显式允许 AI 兜底时，才继续用旧的直接切到 ai_visuals 的行为。
+            fallback_source = "ai_visuals" if not params.disable_ai_visuals else "real_images"
             logger.info(
                 f"subject '{params.video_subject}' looks fictional/has no real-world "
-                f"footage available; using AI-generated visuals for this run "
+                f"stock footage available; using '{fallback_source}' for this run "
                 f"(original selection: '{params.video_source}')"
             )
-            effective_video_source = "ai_visuals"
+            effective_video_source = fallback_source
 
     if stop_at == "script":
         sm.state.update_task(
@@ -538,6 +671,19 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     if not downloaded_videos:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return
+
+    if effective_video_source != "local":
+        # 本地素材是用户手动挑选的，没有"搜索词/主题相关性"这个概念，
+        # 跳过视觉相关性检查；其它来源都可能因为文本匹配不准确而混入
+        # 画面上完全不相关的素材，用免费视觉模型再做一层把关。
+        downloaded_videos = visual_gate.filter_relevant_clips(
+            downloaded_videos, params.video_subject
+        )
+        # 技术质量把关（近黑屏/模糊/重复）不依赖搜索词相关性判断，
+        # 本地素材同样可能踩中这些问题，因此对所有来源统一生效。
+    downloaded_videos = quality_gate.filter_low_quality_clips(downloaded_videos)
+    # 开场镜头决定观众要不要划走，把视觉上最抓眼的一段素材挪到最前面。
+    downloaded_videos = quality_gate.rank_by_visual_interest(downloaded_videos)
 
     if stop_at == "materials":
         sm.state.update_task(

@@ -1,6 +1,7 @@
 import os
 import random
 import re
+import subprocess
 import threading
 from typing import List
 from urllib.parse import urlencode
@@ -401,20 +402,137 @@ def search_videos_coverr(
     return []
 
 
-def search_and_download_youtube_clip(
-    search_term: str,
-    minimum_duration: int,
-    max_clip_duration: int,
-    video_subject: str,
-    output_dir: str,
-) -> str:
-    """
-    在 YouTube 上搜索与 search_term 相关的视频，下载其中一小段作为素材。
+# 实测拉一段 5s 的 1080p 直链需要 ~82s（YouTube 的 DASH CDN 对区间请求限速），
+# 之前 15s 的预算意味着这条路径 100% 超时，每次都回退到渐进式流——也就是
+# 永远只能拿到 360p 素材，再花几十秒去做注定失败的放大。宁可在这里多等一会
+# 拿到真实的 1080p 像素，也比拿 360p 再插值出"假细节"划算。
+_YT_1080P_FETCH_TIMEOUT = 120
 
-    与 Pexels/Pixabay 不同：这里的目标就是找到真实拍到主体本人/事件的视频，
-    所以标题相关性过滤是必须的，不能跳过（跳过会退化成随便下一个热门视频）。
-    只下载一小段而不是整条视频，减小体积、降低使用风险，但不改变这类素材
-    本质上是他人版权内容这一事实——调用方必须已经确认接受这一点。
+
+def _pick_best_avc1_video_url(video_url: str, max_height: int = 1080) -> str | None:
+    """解析出一个纯视频、H.264 编码、mp4 容器、不超过 max_height 的直链。
+
+    只做元数据解析（走 YouTube 自己的 API，返回很快），不涉及从 CDN 拉取
+    媒体数据本身，所以不会卡在下面 _download_youtube_clip_1080p 那种大文件
+    区间拉取可能遇到的网络问题上。
+    """
+    import yt_dlp
+
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+    except Exception as e:
+        logger.debug(f"youtube: failed to resolve formats for '{video_url}': {e}")
+        return None
+
+    candidates = [
+        f
+        for f in (info or {}).get("formats") or []
+        if f.get("ext") == "mp4"
+        and f.get("acodec") == "none"
+        and str(f.get("vcodec") or "").startswith("avc1")
+        and (f.get("height") or 0) <= max_height
+        and f.get("url")
+    ]
+    if not candidates:
+        return None
+
+    best = max(candidates, key=lambda f: f.get("height") or 0)
+    return best["url"]
+
+
+def _download_youtube_clip_1080p(
+    video_url: str, start: float, end: float, output_path: str
+) -> bool:
+    """直接用 ffmpeg 截取一段 1080p 纯视频流，绕开 yt-dlp 的 external
+    downloader 机制。
+
+    yt-dlp 遇到 download_ranges + 需要合并/裁切的场景时，会自己拼一条
+    ffmpeg 命令去做区间拉取；这条路径在部分网络环境下会在拉取 DASH
+    (纯视频流) 时卡死且没有任何超时保护，拉不到东西也不报错，只是
+    一直挂着。这里改为自己解析出直链、自己调用 ffmpeg，用
+    subprocess.run 自带的 timeout 兜底：超时或失败都会返回 False，
+    交给调用方回退到已验证可靠的渐进式流下载。
+    """
+    video_source_url = _pick_best_avc1_video_url(video_url)
+    if not video_source_url:
+        return False
+
+    duration = end - start
+    if duration <= 0:
+        return False
+
+    cmd = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        "-ss", f"{start:.3f}",
+        "-i", video_source_url,
+        "-t", f"{duration:.3f}",
+        "-an",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=_YT_1080P_FETCH_TIMEOUT
+        )
+        if result.returncode != 0:
+            logger.debug(
+                f"youtube: 1080p direct fetch failed, will fall back to "
+                f"progressive stream: {(result.stderr or b'')[-300:]}"
+            )
+            return False
+    except subprocess.TimeoutExpired:
+        logger.debug(
+            "youtube: 1080p direct fetch timed out, falling back to "
+            "progressive stream"
+        )
+        return False
+    except Exception as e:
+        logger.debug(f"youtube: 1080p direct fetch failed: {e}")
+        return False
+
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+
+def _download_youtube_clip_progressive_fallback(
+    video_url: str, start: float, end: float, output_path: str
+) -> bool:
+    """兜底路径：yt-dlp 自带的渐进式流下载，画质通常只有 720p 甚至更低，
+    但在各种网络环境下都验证过快速可靠，用作 1080p 直链拉取失败时的保底。
+    """
+    import yt_dlp
+
+    download_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "best[height<=1920][ext=mp4]/best[ext=mp4]/best",
+        "outtmpl": output_path,
+        "download_ranges": yt_dlp.utils.download_range_func(None, [(start, end)]),
+        "force_keyframes_at_cuts": True,
+        "ffmpeg_location": utils.get_ffmpeg_binary(),
+    }
+    try:
+        with yt_dlp.YoutubeDL(download_opts) as ydl:
+            ydl.download([video_url])
+    except Exception as e:
+        logger.error(f"youtube clip download failed for '{video_url}': {e}")
+        return False
+
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+
+def find_best_youtube_video(
+    search_term: str, video_subject: str, minimum_duration: int = 0
+) -> dict | None:
+    """在 YouTube 上找到与 search_term/video_subject 最相关的一条视频。
+
+    标题相关性过滤复用 _extract_subject_keywords/_text_matches_subject。
+    截取片段（search_and_download_youtube_clip）和截图（
+    extract_screenshot_frames）都基于这里返回的同一条已验证视频，避免
+    两者分别独立搜索导致"关键词对得上但画面其实不相关"的问题。
     """
     import yt_dlp
 
@@ -433,9 +551,8 @@ def search_and_download_youtube_clip(
             entries = (info or {}).get("entries") or []
     except Exception as e:
         logger.error(f"youtube search failed for '{search_term}': {e}")
-        return ""
+        return None
 
-    candidates = []
     for entry in entries:
         if not entry:
             continue
@@ -446,17 +563,51 @@ def search_and_download_youtube_clip(
             continue
         if subject_keywords and not _text_matches_subject(title, subject_keywords):
             continue
-        candidates.append((video_id, title, duration))
+        return {
+            "video_id": video_id,
+            "title": title,
+            "duration": duration,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+        }
 
-    if not candidates:
-        logger.info(
-            f"youtube: no title-relevant results for '{search_term}' "
-            f"(subject keywords: {subject_keywords})"
-        )
+    logger.info(
+        f"youtube: no title-relevant results for '{search_term}' "
+        f"(subject keywords: {subject_keywords})"
+    )
+    return None
+
+
+def _download_youtube_segment(
+    video_url: str, start: float, end: float, output_path: str
+) -> bool:
+    """截取 [start, end) 这段视频，优先走 1080p 直链，失败则回退到渐进式流。"""
+    if _download_youtube_clip_1080p(video_url, start, end, output_path):
+        return True
+    return _download_youtube_clip_progressive_fallback(video_url, start, end, output_path)
+
+
+def search_and_download_youtube_clip(
+    search_term: str,
+    minimum_duration: int,
+    max_clip_duration: int,
+    video_subject: str,
+    output_dir: str,
+) -> str:
+    """
+    在 YouTube 上搜索与 search_term 相关的视频，下载其中一小段作为素材。
+
+    与 Pexels/Pixabay 不同：这里的目标就是找到真实拍到主体本人/事件的视频，
+    所以标题相关性过滤是必须的，不能跳过（跳过会退化成随便下一个热门视频）。
+    只下载一小段而不是整条视频，减小体积、降低使用风险，但不改变这类素材
+    本质上是他人版权内容这一事实——调用方必须已经确认接受这一点。
+    """
+    video = find_best_youtube_video(search_term, video_subject, minimum_duration)
+    if not video:
         return ""
 
-    video_id, title, duration = candidates[0]
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    video_id, title, duration, video_url = (
+        video["video_id"], video["title"], video["duration"], video["url"],
+    )
 
     # 跳过大概率是片头的开场部分，从视频中段附近截取一小段。
     start = min(20, max(0, duration // 4))
@@ -470,28 +621,78 @@ def search_and_download_youtube_clip(
     if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         return output_path
 
-    download_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "best[height<=1920][ext=mp4]/best[ext=mp4]/best",
-        "outtmpl": output_path,
-        "download_ranges": yt_dlp.utils.download_range_func(None, [(start, end)]),
-        "force_keyframes_at_cuts": True,
-        "ffmpeg_location": utils.get_ffmpeg_binary(),
-    }
-    try:
-        with yt_dlp.YoutubeDL(download_opts) as ydl:
-            ydl.download([video_url])
-    except Exception as e:
-        logger.error(f"youtube clip download failed for '{video_url}': {e}")
-        return ""
-
-    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+    if _download_youtube_segment(video_url, start, end, output_path):
         logger.info(
             f"youtube: downloaded clip from '{title}' ({start}s-{end}s) for '{search_term}'"
         )
         return output_path
     return ""
+
+
+def extract_screenshot_frames(
+    video_id: str,
+    video_url: str,
+    duration: float,
+    output_dir: str,
+    max_frames: int = 6,
+    segment_seconds: int = 60,
+) -> List[str]:
+    """从一条已验证主体相关的视频里截取一段本地素材，再从本地均匀抽出若干
+    静态截图。
+
+    截图取自视频本身，而不是另外发起一次独立的图片搜索，所以画面内容天然
+    和视频主体一致，不会出现关键词对得上、但图片其实是无关素材（比如纯
+    天空背景）的问题。抽帧走本地文件而不是对远端直链反复 seek，更稳定也
+    更快。
+    """
+    if duration <= 0:
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    margin = duration * 0.1
+    seg_start = margin
+    seg_end = min(duration - margin, seg_start + segment_seconds)
+    if seg_end - seg_start < 5:
+        seg_start, seg_end = 0, min(duration, segment_seconds)
+
+    local_path = os.path.join(output_dir, f"ssbase-{video_id}.mp4")
+    if not (os.path.exists(local_path) and os.path.getsize(local_path) > 0):
+        if not _download_youtube_segment(video_url, seg_start, seg_end, local_path):
+            return []
+
+    seg_duration = seg_end - seg_start
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    frame_paths = []
+    for i in range(1, max_frames + 1):
+        ts = seg_duration * i / (max_frames + 1)
+        frame_path = os.path.join(output_dir, f"ssframe-{video_id}-{i}.jpg")
+        if os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+            frame_paths.append(frame_path)
+            continue
+        cmd = [
+            ffmpeg_binary, "-y",
+            "-ss", f"{ts:.3f}",
+            "-i", local_path,
+            "-frames:v", "1",
+            "-q:v", "2",
+            frame_path,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=15)
+            if (
+                result.returncode == 0
+                and os.path.exists(frame_path)
+                and os.path.getsize(frame_path) > 0
+            ):
+                frame_paths.append(frame_path)
+        except Exception as e:
+            logger.debug(
+                f"screenshot extraction failed at {ts:.1f}s in local segment "
+                f"for '{video_id}': {e}"
+            )
+
+    return frame_paths
 
 
 def download_youtube_videos(

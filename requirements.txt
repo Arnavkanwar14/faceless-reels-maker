@@ -20,3 +20,14 @@ pydub==0.25.1
 audioop-lts==0.2.2; python_version >= "3.13"
 litellm==1.86.2
 yt-dlp
+ddgs
+# Optional heavy deps: Kokoro TTS voice + Real-ESRGAN still-image upscaling.
+# Install torch from https://download.pytorch.org/whl/cpu on machines without
+# a working CUDA setup (see CLAUDE.md) - the default PyPI wheel pulls a much
+# larger CUDA build that isn't needed for either feature.
+torch
+torchvision
+kokoro==0.9.4
+soundfile==0.14.0
+realesrgan==0.3.0
+basicsr==1.4.2

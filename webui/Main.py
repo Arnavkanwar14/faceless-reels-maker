@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import webbrowser
 from collections.abc import Mapping
 from datetime import datetime
@@ -538,9 +539,17 @@ def _collect_task_summaries(limit=20):
             "source": "runtime",
         }
 
-    for task_id, active_task in _active_generation_tasks().items():
+    # 生成已改为后台线程执行，会话里的“生成中”标记不再由生成流程自己清理。
+    # 这里根据运行期状态兜底：任务一旦进入终态（完成或失败），就清掉标记，
+    # 否则下面的覆盖逻辑会把已结束（尤其是失败）的任务一直显示成“生成中”。
+    for task_id in list(_active_generation_tasks().keys()):
+        active_task = _active_generation_tasks()[task_id]
         history_task = history_tasks.get(task_id, {})
-        if history_task and _task_state_filter_key(history_task) == "complete":
+        if history_task and _task_state_filter_key(history_task) in (
+            "complete",
+            "failed",
+        ):
+            _remove_active_generation_task(task_id)
             continue
 
         task_path = os.path.join(utils.task_dir(), task_id)
@@ -856,6 +865,8 @@ def _infer_tts_server_from_voice(voice_name):
         return "elevenlabs"
     if voice.is_chatterbox_voice(voice_name):
         return "chatterbox"
+    if voice.is_kokoro_voice(voice_name):
+        return "kokoro-tts"
     if voice.is_azure_v2_voice(voice_name):
         return "azure-tts-v2"
     return "azure-tts-v1"
@@ -1271,7 +1282,11 @@ def render_generation_logs(container):
         container.empty()
         return
 
-    log_records = st.session_state.get("generation_log_records", [])
+    # 生成在后台线程执行，日志写进进程级缓冲区而非 session_state。这里按当前
+    # 会话记录的任务 id 读取对应缓冲，配合任务管理 fragment 的定时刷新逐步展示。
+    log_records = _get_generation_log_records(
+        st.session_state.get("generation_log_task_id")
+    )
     if not log_records:
         container.empty()
         return
@@ -1288,6 +1303,65 @@ def remove_logger_handler_safely(handler_id):
         # 已经被其它初始化流程移除。这里忽略缺失 handler，避免生成成功后
         # 因清理日志监听器失败而把页面打成异常。
         logger.debug(f"log handler already removed: {handler_id}")
+
+
+# 生成过程放到后台线程执行（见 _start_generation_in_background），线程里不能
+# 访问 Streamlit 的 session_state / st.*。这里用一个进程级、带锁的日志缓冲区
+# 承接后台任务日志，主线程每次 rerun 再从缓冲区读取展示，既不阻塞脚本线程，
+# 也不丢失原来的实时日志面板。
+_GENERATION_LOG_LOCK = threading.Lock()
+_GENERATION_LOG_BUFFERS: dict = {}
+
+
+def _get_generation_log_records(task_id):
+    if not task_id:
+        return []
+    with _GENERATION_LOG_LOCK:
+        return list(_GENERATION_LOG_BUFFERS.get(task_id, []))
+
+
+def _start_generation_in_background(task_id, params):
+    # tm.start() 会阻塞几分钟。放在当前脚本线程里执行会让触发生成的这个标签页
+    # 在整个生成期间无法完成一次脚本重跑——用户刷新页面时 Streamlit 无法返回
+    # 新的渲染，页面就变成一片空白。改为后台守护线程执行，脚本线程立刻返回，
+    # 进度由每 2 秒刷新的任务管理 fragment 从 sm.state 读取。
+    buffer = []
+    with _GENERATION_LOG_LOCK:
+        _GENERATION_LOG_BUFFERS[task_id] = buffer
+
+    def sink(msg):
+        if config.ui.get("hide_log", False):
+            return
+        with _GENERATION_LOG_LOCK:
+            buffer.append(str(msg).rstrip())
+            if len(buffer) > 1000:
+                del buffer[:-1000]
+
+    handler_id = logger.add(sink)
+
+    def _run():
+        try:
+            result = tm.start(task_id=task_id, params=params)
+            if not result or "videos" not in result:
+                logger.error("Video Generation Failed")
+                sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            else:
+                logger.info("Video Generation Completed")
+        except Exception as e:
+            logger.exception(
+                f"background video generation crashed: task_id={task_id}, {e}"
+            )
+            try:
+                sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            except Exception:
+                logger.exception(
+                    f"failed to mark task failed after crash: task_id={task_id}"
+                )
+        finally:
+            remove_logger_handler_safely(handler_id)
+
+    thread = threading.Thread(target=_run, name=f"gen-{task_id}", daemon=True)
+    thread.start()
 
 
 def get_llm_provider_tips(provider_id, **kwargs):
@@ -2084,6 +2158,7 @@ def _render_video_settings(panel, params):
                 (tr("Pixabay"), "pixabay"),
                 (tr("Coverr"), "coverr"),
                 (tr("YouTube (copyright risk)"), "youtube"),
+                (tr("Real Images (YouTube/web, copyright risk)"), "real_images"),
                 (tr("Local file"), "local"),
             ]
 
@@ -2107,6 +2182,26 @@ def _render_video_settings(panel, params):
                     "Using them in a published/monetized video is a real "
                     "Content-ID/copyright risk you are choosing to accept."
                 )
+
+            if params.video_source == "real_images":
+                st.warning(
+                    "YouTube thumbnails and web-search images are other people's "
+                    "copyrighted content, same as the YouTube clip source. Using "
+                    "them in a published/monetized video is a real copyright risk "
+                    "you are choosing to accept."
+                )
+
+            saved_disable_ai_visuals = config.app.get("disable_ai_visuals", True)
+            st.session_state.setdefault(
+                "disable_ai_visuals_checkbox", not saved_disable_ai_visuals
+            )
+            allow_ai_fallback = st.checkbox(
+                tr("Allow AI-generated images as last resort"),
+                help=tr("Allow AI-generated images as last resort Help"),
+                key="disable_ai_visuals_checkbox",
+            )
+            params.disable_ai_visuals = not allow_ai_fallback
+            config.app["disable_ai_visuals"] = params.disable_ai_visuals
 
             if params.video_source == "local":
                 # Streamlit 的文件类型校验对扩展名大小写敏感，这里同时放行大小写两种形式。
@@ -2154,6 +2249,7 @@ def _render_video_settings(panel, params):
                 (tr("FadeOut"), VideoTransitionMode.fade_out.value),
                 (tr("SlideIn"), VideoTransitionMode.slide_in.value),
                 (tr("SlideOut"), VideoTransitionMode.slide_out.value),
+                (tr("ZoomPunch"), VideoTransitionMode.zoom_punch.value),
             ]
             selected_transition_mode = stable_selectbox(
                 tr("Video Transition Mode"),
@@ -2165,6 +2261,14 @@ def _render_video_settings(panel, params):
                 )[value],
             )
             params.video_transition_mode = VideoTransitionMode(selected_transition_mode)
+
+            st.session_state.setdefault("loop_seam_checkbox", config.ui.get("loop_seam", False))
+            params.loop_seam = st.checkbox(
+                tr("Seamless Loop"),
+                help=tr("Seamless Loop Help"),
+                key="loop_seam_checkbox",
+            )
+            config.ui["loop_seam"] = params.loop_seam
 
             video_aspect_ratios = [
                 (tr("Portrait"), VideoAspect.portrait.value),
@@ -2249,6 +2353,12 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
     if selected_tts_server == "chatterbox":
         _sync_chatterbox_config_from_session_state()
     play_content = params.video_subject or params.video_script
+    # video_script 常常是完整的多句脚本；预览只是想听一下音色，不该把
+    # 整段脚本都合成一遍——本地 TTS（Kokoro/Chatterbox）在 CPU 上合成
+    # 长文本可能要跑很久，会让整个页面卡在这一次点击上没有任何反馈。
+    _PREVIEW_MAX_CHARS = 200
+    if play_content and len(play_content) > _PREVIEW_MAX_CHARS:
+        play_content = play_content[:_PREVIEW_MAX_CHARS].rsplit(" ", 1)[0].strip()
     if not play_content:
         # ElevenLabs 音色缺少明确语言字段时，根据展示名称中的越南语字符
         # 选择试听文案，避免用不匹配的语言判断音色效果。
@@ -2316,6 +2426,7 @@ def _render_background_music_settings(params):
         (tr("No Background Music"), ""),
         (tr("Random Background Music"), "random"),
         (tr("Custom Background Music"), "custom"),
+        (tr("Search & Download Background Music"), "download"),
     ]
     selected_bgm_type = stable_selectbox(
         tr("Background Music Source"),
@@ -2334,6 +2445,16 @@ def _render_background_music_settings(params):
         if custom_bgm_file:
             # 文件名由服务层映射到 resource/songs 后校验，UI 不接受任意路径。
             params.bgm_file = custom_bgm_file.strip()
+    elif params.bgm_type == "download":
+        bgm_search_query = st.text_input(
+            tr("Background Music Search"),
+            help=tr("Background Music Search Help"),
+            placeholder=tr("Background Music Search Placeholder"),
+            key="bgm_search_query_input",
+        )
+        # 复用 bgm_file 字段承载搜索词——这个模式下它不是文件路径，
+        # 而是要在免版税曲库里搜索的标题/情绪描述。
+        params.bgm_file = bgm_search_query.strip()
     params.bgm_volume = stable_selectbox(
         tr("Background Music Volume"),
         options=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
@@ -2391,6 +2512,7 @@ def _render_audio_settings(panel, params):
                 ("mimo-tts", "Xiaomi MiMo TTS"),
                 ("elevenlabs", "ElevenLabs TTS"),
                 ("chatterbox", "Chatterbox TTS"),
+                ("kokoro-tts", "Kokoro TTS (local, free)"),
             ]
 
             tts_server_values = [server_value for server_value, _ in tts_servers]
@@ -2456,6 +2578,9 @@ def _render_audio_settings(panel, params):
                 # 自托管 Chatterbox 服务的预置音色（来自 [chatterbox] voices 配置）
                 _sync_chatterbox_config_from_session_state()
                 filtered_voices = voice.get_chatterbox_voices()
+            elif selected_tts_server == "kokoro-tts":
+                # 本地免费 Kokoro TTS 的预置音色
+                filtered_voices = voice.get_kokoro_voices()
             else:
                 # 获取Azure的声音列表
                 all_voices = voice.get_all_azure_voices(filter_locals=None)
@@ -2958,6 +3083,22 @@ def _render_subtitle_settings(panel, params):
                     selected_rounded_subtitle_background
                 )
 
+            saved_karaoke_captions = config.ui.get("karaoke_captions", False)
+            st.session_state.setdefault(
+                "karaoke_captions_checkbox", saved_karaoke_captions
+            )
+            selected_karaoke_captions = st.checkbox(
+                tr("Word-by-word Captions"),
+                help=tr("Word-by-word Captions Help"),
+                disabled=subtitle_settings_disabled,
+                key="karaoke_captions_checkbox",
+            )
+            params.karaoke_captions = (
+                selected_karaoke_captions if params.subtitle_enabled else False
+            )
+            if not subtitle_settings_disabled:
+                config.ui["karaoke_captions"] = selected_karaoke_captions
+
             if video.subtitle_colors_are_indistinguishable(params):
                 # 同色配置仍然是合法的用户选择，因此只在字幕设置区域就近提示，
                 # 不阻止生成。用户可以根据实际视觉需求决定是否继续。
@@ -3034,7 +3175,7 @@ def _render_generation_controls(
             st.error(tr("Video Script and Subject Cannot Both Be Empty"))
             st.stop()
 
-        if params.video_source not in ["pexels", "pixabay", "coverr", "youtube", "local"]:
+        if params.video_source not in ["pexels", "pixabay", "coverr", "youtube", "real_images", "local"]:
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
             st.stop()
@@ -3143,63 +3284,18 @@ def _render_generation_controls(
                 if m.url:
                     params.video_materials.append(m)
 
-        def log_received(msg):
-            if config.ui["hide_log"]:
-                return
-            records = st.session_state.setdefault("generation_log_records", [])
-            records.append(str(msg).rstrip())
-            # 日志用于 WebUI 诊断，不需要无限增长；限制数量避免长任务反复
-            # rerun 后页面负担过重。
-            if len(records) > 1000:
-                del records[:-1000]
-            render_generation_logs(log_container)
+        st.toast(tr("Generating Video"))
+        logger.info(tr("Start Generating Video"))
+        logger.info(utils.to_json(params))
 
-        log_handler_id = logger.add(log_received)
-        try:
-            st.toast(tr("Generating Video"))
-            logger.info(tr("Start Generating Video"))
-            logger.info(utils.to_json(params))
-
-            # 不要用 runtime_config_lock 包住整个生成过程：这把锁是全局的
-            # threading.RLock，_SynchronizedConfig 的每次写操作（包括页面
-            # 正常渲染时几乎必然执行的 config.app["video_source"] = ... 这类
-            # 赋值）都要抢它。生成一次视频可能持续好几分钟，锁被占用期间，
-            # 任何刷新页面或打开新标签页的会话只要渲染到一次 config 写入就
-            # 会卡死，直到这次生成完成——用户实际遇到的“重新加载后本地页面
-            # 卡住，得强制刷新才能看到进度”正是这个原因。这把锁本来是为了
-            # 防止另一个标签页在生成过程中中途切换 Provider/密钥，但配置的
-            # 读取（.get()）本来就不受这把锁保护，真正需要保护的窗口很短，
-            # 不值得为此让整个 WebUI 在生成期间对其它会话失去响应。
-            result = tm.start(task_id=task_id, params=params)
-            if not result or "videos" not in result:
-                st.error(tr("Video Generation Failed"))
-                logger.error(tr("Video Generation Failed"))
-                st.stop()
-
-            video_files = result.get("videos", [])
-            st.success(tr("Video Generation Completed"))
-            try:
-                if video_files:
-                    player_cols = st.columns(len(video_files) * 2 + 1)
-                    for i, url in enumerate(video_files):
-                        player_cols[i * 2 + 1].video(url)
-            except Exception as e:
-                logger.exception(
-                    f"failed to render generated video preview: task_id={task_id}, "
-                    f"video_files={video_files}, error={e}"
-                )
-
-            open_task_folder(task_id)
-            logger.info(tr("Video Generation Completed"))
-        finally:
-            _remove_active_generation_task(task_id)
-            remove_logger_handler_safely(log_handler_id)
-
-        # tm.start() blocks the script for the whole generation run, during
-        # which the Task Manager fragment (rendered earlier in this same
-        # script pass, at the top of the page) cannot re-execute and pick up
-        # the just-completed task. A full rerun here refreshes it without
-        # requiring the user to manually reload the page.
+        # 关键修复：不在脚本线程里同步执行 tm.start()。它会阻塞几分钟，导致触发
+        # 生成的标签页在整个生成期间无法完成脚本重跑——用户刷新页面时 Streamlit
+        # 返回不了新渲染，页面就变成一片空白（“hard reload 后白屏”）。改为后台
+        # 线程执行，脚本线程立刻返回；进度和最终成片由每 2 秒刷新的任务管理
+        # fragment 从 sm.state 读取展示，其它标签页/会话也不再被拖住。
+        _start_generation_in_background(task_id=task_id, params=params)
+        st.session_state["generation_log_task_id"] = task_id
+        # 立即 rerun 让页面回到可响应状态，任务管理入口随即显示“生成中”。
         st.rerun(scope="app")
 
     render_generation_logs(log_container)

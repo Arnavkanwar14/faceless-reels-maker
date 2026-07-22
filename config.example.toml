@@ -187,6 +187,19 @@ litellm_model_name = ""
 groq_api_key = ""
 groq_base_url = ""
 groq_model_name = ""
+# Optional: reuses groq_api_key above. Free vision-model check that a
+# downloaded/generated clip's frame actually matches the video subject, and
+# that it carries no third-party watermark/channel logo, before it's used.
+groq_vision_model_name = ""
+
+# Fallback vision provider for the same check. Groq's free tier allows about
+# 80 image checks per day; once that runs out the check can't run at all, and
+# an unverified image is exactly how a watermarked one slips into a video.
+# Gemini takes over when Groq is rate-limited, so the check keeps working.
+# Get a key at https://aistudio.google.com/apikey
+# Leave BOTH this and groq_api_key empty to disable the visual check entirely.
+gemini_vision_api_key = ""
+gemini_vision_model_name = ""
 
 # Pollinations AI: https://enter.pollinations.ai/
 pollinations_api_key = ""

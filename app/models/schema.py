@@ -27,6 +27,7 @@ class VideoTransitionMode(str, Enum):
     fade_out = "FadeOut"
     slide_in = "SlideIn"
     slide_out = "SlideOut"
+    zoom_punch = "ZoomPunch"
 
 
 class VideoAspect(str, Enum):
@@ -84,6 +85,10 @@ class VideoParams(BaseModel):
     video_materials: Optional[List[MaterialInfo]] = (
         None  # Materials used to generate the video
     )
+    # 默认关闭 AI 生成图像/视频兜底——用户明确不想要 AI 生成的画面出现在
+    # 成片里，哪怕是找不到真实素材时的最后兜底也不行。勾选后才允许回退到
+    # ai_visuals；未勾选时找不到真实素材直接判失败，绝不静默产出 AI 画面。
+    disable_ai_visuals: bool = True
     
     custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
     video_language: Optional[str] = ""  # auto detect
@@ -102,6 +107,8 @@ class VideoParams(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
+    karaoke_captions: bool = False
+    loop_seam: bool = False
 
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"

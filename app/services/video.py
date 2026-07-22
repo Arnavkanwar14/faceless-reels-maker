@@ -1,6 +1,7 @@
 import glob
 import itertools
 import io
+import json
 import os
 import random
 import gc
@@ -22,6 +23,7 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    vfx,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
@@ -35,6 +37,7 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services import bgm
 from app.services.utils import video_effects
 from app.utils import file_security, utils
 
@@ -434,6 +437,56 @@ def _open_video_clip_quietly(video_path: str, audio: bool = False) -> VideoFileC
     return clip
 
 
+def _make_blurred_fill_background(
+    source_path: str,
+    start_time: float,
+    end_time: float,
+    width: int,
+    height: int,
+    output_path: str,
+) -> bool:
+    """用同一段素材本身、放大模糊后铺满整个画幅，代替黑边填充空白区域。
+
+    这是 Shorts/Reels 类竖屏视频的标准处理方式：横屏素材塞进竖屏画框时，
+    与其露出大片黑边，不如用素材自己模糊放大后垫底，观感更完整、更专业。
+    比直接裁切成目标画幅更安全——裁切 16:9 到 9:16 会丢掉约 70% 画面，
+    容易把画面主体（尤其是人脸）直接裁没；模糊铺底能保留完整画面内容。
+    """
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    duration = max(0.0, end_time - start_time)
+    if duration <= 0:
+        return False
+
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-ss", f"{start_time:.3f}",
+        "-i", source_path,
+        "-t", f"{duration:.3f}",
+        "-vf",
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},gblur=sigma=20",
+        "-an",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        output_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            logger.warning(
+                f"blurred background render failed, falling back to black "
+                f"background: {(result.stderr or '')[-300:]}"
+            )
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        logger.warning(
+            f"blurred background render failed, falling back to black background: {e}"
+        )
+        return False
+
+
 def close_clip(clip):
     if clip is None:
         return
@@ -507,6 +560,21 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     if not bgm_type:
         return ""
 
+    if bgm_type == "download":
+        # bgm_file 在这个模式下是搜索词（歌曲名/情绪描述），不是文件路径。
+        # 下载下来的曲目会缓存进 resource/songs，之后也会自然成为
+        # "random" 模式可选的一部分，相当于每次搜索都在给素材库扩容。
+        if not bgm_file:
+            logger.warning("bgm_type is 'download' but no search query provided")
+            return ""
+        downloaded_path = bgm.download_bgm_by_title(bgm_file)
+        if not downloaded_path:
+            logger.warning(
+                f"no royalty-free bgm match found for '{bgm_file}', "
+                "continuing without background music"
+            )
+        return downloaded_path or ""
+
     if bgm_file:
         song_dir = utils.song_dir()
         try:
@@ -548,6 +616,7 @@ def combine_videos(
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: int = 5,
     threads: int = 2,
+    sentence_durations: List[float] | None = None,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -571,6 +640,11 @@ def combine_videos(
     aspect = VideoAspect(video_aspect)
     video_width, video_height = aspect.to_resolution()
 
+    # 按句子边界剪辑时，画面切换点由句子时长决定，而不是固定的
+    # max_clip_duration；这里不预先按固定时长切块，保留每段素材的完整
+    # 可用时长，具体截取多长留给下面的主循环按当前句子时长决定。
+    use_sentence_cuts = bool(sentence_durations)
+
     processed_clips = []
     subclipped_items = []
     video_duration = 0
@@ -579,7 +653,20 @@ def combine_videos(
         clip_duration = clip.duration
         clip_w, clip_h = clip.size
         close_clip(clip)
-        
+
+        if use_sentence_cuts:
+            subclipped_items.append(
+                SubClippedVideoClip(
+                    file_path=video_path,
+                    start_time=0,
+                    end_time=clip_duration,
+                    width=clip_w,
+                    height=clip_h,
+                    source_file_path=video_path,
+                )
+            )
+            continue
+
         start_time = 0
 
         while start_time < clip_duration:
@@ -608,14 +695,22 @@ def combine_videos(
         subclipped_items=subclipped_items,
         concat_mode=video_concat_mode,
     )
-        
+
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
-    
+
+    sentence_duration_cycle = (
+        itertools.cycle(sentence_durations) if use_sentence_cuts else None
+    )
+
     # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
     for i, subclipped_item in enumerate(subclipped_items):
         if video_duration >= required_video_duration:
             break
-        
+
+        target_duration = (
+            next(sentence_duration_cycle) if sentence_duration_cycle else max_clip_duration
+        )
+
         logger.debug(
             f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, "
             f"source: {os.path.basename(subclipped_item.source_file_path)}, "
@@ -624,18 +719,27 @@ def combine_videos(
         )
         
         try:
+            clip_start = subclipped_item.start_time
+            clip_end = subclipped_item.end_time
+            if i == 0 and (clip_end - clip_start) > 2.0:
+                # 开场镜头从素材中段开始，而不是逐帧从头播——跳过大概率
+                # 是片头黑场/标志/静止起始帧的开头一小段，直接切入更有
+                # 动作感的画面，第一秒就能抓住观众。
+                clip_start += min(1.0, (clip_end - clip_start) * 0.2)
             clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
-                subclipped_item.start_time, subclipped_item.end_time
+                clip_start, clip_end
             )
             clip_duration = clip.duration
             # Not all videos are same size, so we need to resize them
             clip_w, clip_h = clip.size
+            bg_temp_path = None
+            background_clip = None
             if clip_w != video_width or clip_h != video_height:
                 clip_ratio = clip.w / clip.h
                 video_ratio = video_width / video_height
                 logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
-                
-                if clip_ratio == video_ratio:
+
+                if abs(clip_ratio - video_ratio) < 0.01:
                     clip = clip.resized(new_size=(video_width, video_height))
                 else:
                     if clip_ratio > video_ratio:
@@ -646,34 +750,71 @@ def combine_videos(
                     new_width = int(clip_w * scale_factor)
                     new_height = int(clip_h * scale_factor)
 
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
+                    bg_temp_path = f"{output_dir}/temp-bg-{i+1}.mp4"
+                    if _make_blurred_fill_background(
+                        subclipped_item.file_path,
+                        subclipped_item.start_time,
+                        subclipped_item.end_time,
+                        video_width,
+                        video_height,
+                        bg_temp_path,
+                    ):
+                        try:
+                            background_clip = _open_video_clip_quietly(
+                                bg_temp_path
+                            ).with_duration(clip_duration)
+                        except Exception as e:
+                            logger.warning(
+                                f"failed to load blurred background, falling back "
+                                f"to black background: {e}"
+                            )
+                            background_clip = None
+                    if background_clip is None:
+                        background_clip = ColorClip(
+                            size=(video_width, video_height), color=(0, 0, 0)
+                        ).with_duration(clip_duration)
+                        bg_temp_path = None
+
                     clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
-                    
+                    clip = CompositeVideoClip([background_clip, clip_resized])
+
+            # 短视频剪辑的转场应该干脆利落：1 秒淡入/滑入在 3-5 秒的短镜头
+            # 里占比太高，看起来像放映幻灯片。缩短到 0.35 秒，动作还在，
+            # 但不会拖慢切镜节奏。
+            transition_duration = 0.35
             shuffle_side = random.choice(["left", "right", "top", "bottom"])
             if transition_value in (None, VideoTransitionMode.none.value):
                 clip = clip
             elif transition_value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
+                clip = video_effects.fadein_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
+                clip = video_effects.fadeout_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
+                clip = video_effects.slidein_transition(clip, transition_duration, shuffle_side)
             elif transition_value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+                clip = video_effects.slideout_transition(clip, transition_duration, shuffle_side)
+            elif transition_value == VideoTransitionMode.zoom_punch.value:
+                clip = video_effects.zoom_punch_transition(clip, transition_duration)
             elif transition_value == VideoTransitionMode.shuffle.value:
                 transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                    lambda c: video_effects.fadein_transition(c, transition_duration),
+                    lambda c: video_effects.fadeout_transition(c, transition_duration),
+                    lambda c: video_effects.slidein_transition(c, transition_duration, shuffle_side),
+                    lambda c: video_effects.slideout_transition(c, transition_duration, shuffle_side),
+                    lambda c: video_effects.zoom_punch_transition(c, transition_duration),
                 ]
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
-                
+            if clip.duration > target_duration:
+                clip = clip.subclipped(0, target_duration)
+            elif use_sentence_cuts and clip.duration < target_duration:
+                # 句子时长比素材本身还长：循环同一段素材填满这句话的时长，
+                # 而不是提前切到下一段素材——否则这句话内部会多出一次
+                # 不必要的画面切换，违背"剪辑点只落在句子边界"的目的。
+                clip = clip.with_effects([vfx.Loop(duration=target_duration)])
+
+
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
             _write_videofile_with_codec_fallback(
@@ -687,6 +828,15 @@ def combine_videos(
             # Store clip duration before closing
             clip_duration_saved = clip.duration
             close_clip(clip)
+            # CompositeVideoClip 不会递归关闭子 clip 的 reader，模糊背景是独立
+            # 打开的临时文件，必须单独关闭并删除，否则 Windows 上文件句柄未释放
+            # 会导致后续删除/重写这个临时文件时报占用错误。
+            if bg_temp_path is not None:
+                close_clip(background_clip)
+                try:
+                    os.remove(bg_temp_path)
+                except OSError:
+                    pass
 
             processed_clips.append(
                 SubClippedVideoClip(
@@ -891,6 +1041,257 @@ def _get_visible_center_position(
         logger.debug(f"failed to center subtitle text by visible mask: {str(exc)}")
 
     return x, y
+
+
+def _load_karaoke_subtitle_items(words_file: str) -> list:
+    """把逐词时间轴 JSON 转成和 SubtitlesClip.subtitles 相同结构的列表：
+    [((start, end), text), ...]，这样可以直接复用 create_text_clip。"""
+    try:
+        with open(words_file, "r", encoding="utf-8") as f:
+            words = json.load(f)
+    except Exception as e:
+        logger.warning(f"failed to load karaoke word timings: {words_file}, {e}")
+        return []
+
+    items = []
+    for entry in words:
+        word = entry.get("word", "").strip()
+        start = entry.get("start")
+        end = entry.get("end")
+        if not word or start is None or end is None or end <= start:
+            continue
+        items.append(((start, end), word))
+    return items
+
+
+_LOUDNORM_TARGET = "I=-14:TP=-1.5:LRA=11"  # -14 LUFS: common YouTube/short-form target
+
+
+def _duck_bgm_under_narration(
+    narration_path: str,
+    bgm_path: str,
+    bgm_volume: float,
+    duration: float,
+    output_path: str,
+) -> bool:
+    """把旁白和背景音乐混成一条音轨：背景音乐在有人声时自动压低音量
+    （sidechain ducking，专业混音常见手法）。响度归一化在这一步之后
+    单独用两遍 loudnorm 完成，这里只负责混音本身。
+    """
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    filter_complex = (
+        f"[1:a]volume={bgm_volume}[bgmvol];"
+        "[bgmvol][0:a]sidechaincompress="
+        "threshold=0.05:ratio=8:attack=5:release=300:makeup=1:detection=peak[ducked];"
+        "[0:a][ducked]amix=inputs=2:duration=first:normalize=0[out]"
+    )
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-i", narration_path,
+        "-stream_loop", "-1",
+        "-i", bgm_path,
+        "-filter_complex", filter_complex,
+        "-map", "[out]",
+        "-t", f"{duration:.3f}",
+        "-c:a", "pcm_s16le",
+        output_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0:
+            logger.warning(
+                "audio ducking mix failed, falling back to simple volume "
+                f"mix: {(result.stderr or b'')[-300:]}"
+            )
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        logger.warning(f"audio ducking mix failed: {e}")
+        return False
+
+
+def _measure_loudnorm_stats(input_path: str) -> dict | None:
+    """loudnorm 两遍法的第一遍：只测量，不改动音频。
+
+    单遍 loudnorm 是实时估算，短音频或动态范围大的内容误差可以到
+    10 LUFS 以上——两遍法先测量真实响度分布，第二遍再按测量结果做线性
+    增益调整，是 ffmpeg 官方文档推荐的准确响度归一化方式。
+    """
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-i", input_path,
+        "-af", f"loudnorm={_LOUDNORM_TARGET}:print_format=json",
+        "-f", "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, timeout=60, text=True, errors="replace"
+        )
+        stderr = result.stderr or ""
+        json_start = stderr.rfind("{")
+        json_end = stderr.rfind("}")
+        if json_start == -1 or json_end == -1 or json_end < json_start:
+            return None
+        return json.loads(stderr[json_start : json_end + 1])
+    except Exception as e:
+        logger.debug(f"loudnorm measurement pass failed: {e}")
+        return None
+
+
+def _apply_measured_loudnorm(
+    input_path: str, stats: dict, output_path: str
+) -> bool:
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    try:
+        loudnorm_filter = (
+            f"loudnorm={_LOUDNORM_TARGET}:"
+            f"measured_I={stats['input_i']}:"
+            f"measured_TP={stats['input_tp']}:"
+            f"measured_LRA={stats['input_lra']}:"
+            f"measured_thresh={stats['input_thresh']}:"
+            f"offset={stats['target_offset']}:"
+            "linear=true:print_format=summary"
+        )
+    except KeyError as e:
+        logger.debug(f"loudnorm stats missing expected key: {e}")
+        return False
+
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-i", input_path,
+        "-af", loudnorm_filter,
+        "-c:a", "libmp3lame",
+        output_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0:
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        logger.debug(f"loudnorm apply pass failed: {e}")
+        return False
+
+
+def _mix_narration_with_ducked_bgm(
+    narration_path: str,
+    bgm_path: str,
+    bgm_volume: float,
+    duration: float,
+    output_path: str,
+) -> bool:
+    """把旁白和背景音乐混成一条音轨，背景音乐随人声自动压低音量，最终
+    混音再做两遍法响度归一化到 -14 LUFS（YouTube 等平台的常见目标）。
+
+    任何一步失败都直接返回 False，让调用方回退到原有的固定音量叠加
+    方式——这一整条链路是音质加分项，不应该因为可选处理失败就影响
+    视频能否正常生成。
+    """
+    output_dir = os.path.dirname(output_path) or "."
+    ducked_path = os.path.join(output_dir, "temp-ducked-premix.wav")
+
+    if not _duck_bgm_under_narration(
+        narration_path, bgm_path, bgm_volume, duration, ducked_path
+    ):
+        return False
+
+    try:
+        stats = _measure_loudnorm_stats(ducked_path)
+        if stats and _apply_measured_loudnorm(ducked_path, stats, output_path):
+            return True
+
+        logger.debug(
+            "two-pass loudnorm unavailable, falling back to single-pass"
+        )
+        ffmpeg_binary = utils.get_ffmpeg_binary()
+        cmd = [
+            ffmpeg_binary,
+            "-y",
+            "-i", ducked_path,
+            "-af", f"loudnorm={_LOUDNORM_TARGET}",
+            "-c:a", "libmp3lame",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0:
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    finally:
+        if os.path.exists(ducked_path):
+            try:
+                os.remove(ducked_path)
+            except OSError:
+                pass
+
+
+def add_loop_seam(video_path: str, seam_duration: float = 0.35) -> bool:
+    """让视频结尾和开头做一个短暂的交叉溶解，方便短视频平台自动循环
+    播放时衔接得更自然，而不是在循环点出现明显的硬切。
+
+    只处理视频流，音频轨道原样保留；输出总时长和输入完全一致，不会
+    因为加了这个效果导致画面和旁白错位。任何一步失败都直接返回
+    False、不改动原文件——这是可选的收尾加分项，不应该有任何机会
+    破坏已经生成成功的最终视频。
+    """
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    try:
+        with VideoFileClip(video_path) as probe:
+            total_duration = probe.duration
+    except Exception as e:
+        logger.debug(f"loop seam: failed to read duration, skipping: {e}")
+        return False
+
+    if not total_duration or total_duration <= seam_duration * 3:
+        # 视频太短的话，交叉溶解区间会互相重叠甚至超出总时长，直接跳过。
+        return False
+
+    seam = seam_duration
+    body_end = total_duration - seam
+    temp_output = f"{video_path}.loopseam.mp4"
+    filter_complex = (
+        f"[0:v]trim=0:{seam:.3f},setpts=PTS-STARTPTS[head];"
+        f"[0:v]trim={body_end:.3f}:{total_duration:.3f},setpts=PTS-STARTPTS[tail];"
+        f"[tail][head]xfade=transition=fade:duration={seam:.3f}:offset=0[loopseam];"
+        f"[0:v]trim=0:{body_end:.3f},setpts=PTS-STARTPTS[body];"
+        "[body][loopseam]concat=n=2:v=1:a=0[outv]"
+    )
+    cmd = [
+        ffmpeg_binary,
+        "-y",
+        "-i", video_path,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+        "-map", "0:a?",
+        "-c:a", "copy",
+        "-t", f"{total_duration:.3f}",
+        temp_output,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+        if result.returncode != 0 or not os.path.exists(temp_output) or os.path.getsize(temp_output) == 0:
+            logger.debug(
+                f"loop seam render failed, keeping original output: "
+                f"{(result.stderr or b'')[-300:]}"
+            )
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+            return False
+    except Exception as e:
+        logger.debug(f"loop seam render failed, keeping original output: {e}")
+        if os.path.exists(temp_output):
+            try:
+                os.remove(temp_output)
+            except OSError:
+                pass
+        return False
+
+    os.replace(temp_output, video_path)
+    return True
 
 
 def subtitle_colors_are_indistinguishable(params: VideoParams) -> bool:
@@ -1150,7 +1551,17 @@ def generate_video(
             font_size=params.font_size,
         )
 
-    if subtitle_path and os.path.exists(subtitle_path):
+    karaoke_words_file = os.path.join(os.path.dirname(subtitle_path or output_dir), "words.json")
+    if params.subtitle_enabled and getattr(params, "karaoke_captions", False) and os.path.exists(
+        karaoke_words_file
+    ):
+        # 逐词弹出字幕：每个词单独作为一条"字幕行"，只在自己的时间窗口内
+        # 显示，复用和整句字幕完全相同的 create_text_clip 渲染逻辑（字体、
+        # 描边、背景色都不用重新实现），只是喂入的时间轴粒度从整句变成单词。
+        subtitle_items = _load_karaoke_subtitle_items(karaoke_words_file)
+        text_clips = [create_text_clip(subtitle_item=item) for item in subtitle_items]
+        video_clip = CompositeVideoClip([video_clip, *text_clips])
+    elif subtitle_path and os.path.exists(subtitle_path):
         sub = SubtitlesClip(
             subtitles=subtitle_path, encoding="utf-8", make_textclip=make_textclip
         )
@@ -1160,19 +1571,53 @@ def generate_video(
             text_clips.append(clip)
         video_clip = CompositeVideoClip([video_clip, *text_clips])
 
+    mixed_audio_path = None
     bgm_file = get_bgm_file(bgm_type=params.bgm_type, bgm_file=params.bgm_file)
     if bgm_file:
+        narration_export_path = os.path.join(output_dir, "temp-narration-mix-input.mp3")
+        candidate_mixed_path = os.path.join(output_dir, "temp-mixed-audio.mp3")
+        mixed_clip = None
         try:
-            bgm_clip = AudioFileClip(bgm_file).with_effects(
-                [
-                    afx.MultiplyVolume(params.bgm_volume),
-                    afx.AudioFadeOut(3),
-                    afx.AudioLoop(duration=video_clip.duration),
-                ]
-            )
-            audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
+            audio_clip.write_audiofile(narration_export_path, logger=None)
+            if _mix_narration_with_ducked_bgm(
+                narration_path=narration_export_path,
+                bgm_path=bgm_file,
+                bgm_volume=params.bgm_volume,
+                duration=video_clip.duration,
+                output_path=candidate_mixed_path,
+            ):
+                mixed_clip = AudioFileClip(candidate_mixed_path)
         except Exception as e:
-            logger.error(f"failed to add bgm: {str(e)}")
+            logger.warning(
+                f"audio ducking/normalization failed, falling back to simple "
+                f"bgm mix: {str(e)}"
+            )
+            mixed_clip = None
+        finally:
+            if os.path.exists(narration_export_path):
+                try:
+                    os.remove(narration_export_path)
+                except OSError:
+                    pass
+
+        if mixed_clip is not None:
+            audio_clip = mixed_clip
+            mixed_audio_path = candidate_mixed_path
+        else:
+            # 回退路径：ffmpeg 混音失败时（版本过旧缺少 sidechaincompress、
+            # 编码异常等），继续用原来固定音量叠加的方式，保证 BGM 功能
+            # 本身不受影响。
+            try:
+                bgm_clip = AudioFileClip(bgm_file).with_effects(
+                    [
+                        afx.MultiplyVolume(params.bgm_volume),
+                        afx.AudioFadeOut(3),
+                        afx.AudioLoop(duration=video_clip.duration),
+                    ]
+                )
+                audio_clip = CompositeAudioClip([audio_clip, bgm_clip])
+            except Exception as e:
+                logger.error(f"failed to add bgm: {str(e)}")
 
     video_clip = video_clip.with_audio(audio_clip)
     # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
@@ -1192,6 +1637,14 @@ def generate_video(
     )
     video_clip.close()
     del video_clip
+    if mixed_audio_path and os.path.exists(mixed_audio_path):
+        try:
+            os.remove(mixed_audio_path)
+        except OSError:
+            pass
+
+    if getattr(params, "loop_seam", False):
+        add_loop_seam(output_file)
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
