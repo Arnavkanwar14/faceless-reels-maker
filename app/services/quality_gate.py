@@ -155,6 +155,55 @@ def filter_low_quality_clips(video_paths: List[str]) -> List[str]:
     return accepted
 
 
+# 归一化尺寸下的清晰度下限。
+#
+# 直接用像素尺寸判断素材好坏是不够的：网上很多"1600x900"的图其实是把一张
+# 480p 的截图拉大再存一次的产物，尺寸达标但完全没有细节，放进竖屏成片里
+# 就是一团糊，观众根本看不出画面里是什么。
+#
+# _blur_variance 的绝对值会随图片尺寸变化，所以先统一缩放到同一个长边再测，
+# 这样不同来源、不同尺寸的图之间才可比。实测值：
+#   448x252 的糊图              ~790
+#   被判定"看不出是什么"的软图   ~1580
+#   正片抽出的原生 1080p 帧      ~2790
+#   路牌清晰可读的游戏截图       ~3600
+#   官方宣传图                   ~4070
+# 阈值取在 1580 和 2790 之间。
+_MIN_NORMALIZED_SHARPNESS = 2200.0
+_SHARPNESS_NORMALIZE_SIDE = 720
+
+
+def normalized_sharpness(image_path: str) -> float | None:
+    """把图片统一缩放到固定长边后测边缘方差，作为跨尺寸可比的清晰度指标。
+
+    读取失败返回 None，由调用方决定怎么处理（默认按放行处理，不因为测量
+    本身出问题就丢掉素材）。
+    """
+    try:
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+            scale = _SHARPNESS_NORMALIZE_SIDE / max(image.size)
+            if scale < 1:
+                image = image.resize(
+                    (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                    Image.LANCZOS,
+                )
+            return _blur_variance(image)
+    except Exception as e:
+        logger.debug(f"quality_gate: sharpness measure failed for {image_path}: {e}")
+        return None
+
+
+def is_sharp_enough(
+    image_path: str, minimum: float = _MIN_NORMALIZED_SHARPNESS
+) -> bool:
+    """判断图片是否有足够的真实细节，而不只是尺寸达标。"""
+    score = normalized_sharpness(image_path)
+    if score is None:
+        return True
+    return score >= minimum
+
+
 def _load_image(image_path: str) -> Image.Image | None:
     try:
         with Image.open(image_path) as img:

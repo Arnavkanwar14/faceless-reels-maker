@@ -236,13 +236,29 @@ def _download_ddg_image(url: str, output_path: str) -> bool:
 
 
 def _has_usable_source_resolution(image_path: str) -> bool:
-    """判断原图分辨率是否够走后面的裁边 + 放大 + 竖屏裁切。"""
+    """判断原图是否够格进入后面的裁边 + 放大 + 竖屏裁切。
+
+    同时看两件事：像素尺寸够不够，以及画面里是不是真的有细节。只看尺寸会
+    被"低清图拉大再存一次"的素材骗过去——文件写着 1600x900，实际是一张
+    480p 的糊图，裁切放大之后观众根本认不出画面里是什么。
+    """
     try:
         with Image.open(image_path) as img:
             width, height = img.size
     except Exception:
         return False
-    return min(width, height) >= _MIN_SOURCE_SHORT_SIDE
+
+    if min(width, height) < _MIN_SOURCE_SHORT_SIDE:
+        return False
+
+    if not quality_gate.is_sharp_enough(image_path):
+        logger.debug(
+            f"real_images: '{os.path.basename(image_path)}' is {width}x{height} but "
+            "lacks real detail (upscaled/soft source), skipping"
+        )
+        return False
+
+    return True
 
 
 def _collect_video_screenshot_candidates(

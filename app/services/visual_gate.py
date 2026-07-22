@@ -46,6 +46,10 @@ _DEFAULT_GEMINI_VISION_MODEL = "gemini-3.5-flash-lite"
 
 VERDICT_OK = "ok"
 VERDICT_UNRELATED = "unrelated"
+# 和主题不矛盾、但画面本身没有任何能指向主题的信息（随便一辆车、一条普通
+# 街道、一个认不出是什么的特写）。这类图不算"错"，但放进成片就是废镜头，
+# 观众看不出它和主题有什么关系，所以同样要拒掉。
+VERDICT_GENERIC = "generic"
 VERDICT_WATERMARK = "watermark"
 # 检查没能真正跑起来（没配 key、超额、网络错误）。必须和 OK 区分开：把
 # "没检查"当成"检查通过"，正是带水印素材混进成片的原因。
@@ -95,7 +99,7 @@ def _build_prompt(video_subject: str) -> str:
     return (
         "This image was selected as visual material for "
         f"a video about '{video_subject}'.\n\n"
-        "Reply with exactly one of these three tokens:\n"
+        "Reply with exactly one of these four tokens:\n"
         "WATERMARK - if the image carries ANY third-party "
         "branding baked into it: a watermark, a site or "
         "channel logo, a TV network bug, a username/@handle, "
@@ -103,9 +107,23 @@ def _build_prompt(video_subject: str) -> str:
         "title treatment (i.e. it is a composed thumbnail or "
         "article header rather than a plain photo or "
         "screenshot). Check all four corners and all edges.\n"
-        "UNRELATED - if it carries no such branding, but is "
-        "clearly unrelated to the subject.\n"
-        "OK - otherwise.\n\n"
+        "UNRELATED - if it carries no such branding, but shows "
+        "something clearly belonging to a different subject.\n"
+        "COLLAGE - if the image is not one single photograph but a "
+        "grid, collage, montage, split-screen or side-by-side "
+        "comparison built from several separate images, or has "
+        "panels divided by hard straight borders.\n"
+        "GENERIC - if it is plausibly on-topic but contains "
+        "nothing that actually identifies this specific subject: "
+        "an ordinary vehicle, building, street, sky, crowd or "
+        "landscape that could come from almost anywhere, or a "
+        "close-up too tight to tell what it is. Ask yourself "
+        "whether a viewer seeing ONLY this image would recognise "
+        f"it as being about '{video_subject}'. If they could not, "
+        "answer GENERIC.\n"
+        "OK - only if the image is a single unbroken photo or "
+        "screenshot showing something specific and recognisable "
+        "about the subject.\n\n"
         "Answer with the single token only."
     )
 
@@ -184,6 +202,20 @@ def _classify_data_uri(data_uri: str, video_subject: str, label: str) -> str:
                 f"({name}): {label}"
             )
             return VERDICT_UNRELATED
+        if "COLLAGE" in answer:
+            # 和 GENERIC 归为同一类处理（都是"不能当成一个独立镜头用"），
+            # 但日志里保留真实原因，方便排查素材质量问题。
+            logger.info(
+                f"visual_gate: rejected as a collage/grid of multiple images "
+                f"({name}): {label}"
+            )
+            return VERDICT_GENERIC
+        if "GENERIC" in answer:
+            logger.info(
+                f"visual_gate: rejected as generic filler - nothing identifies "
+                f"'{video_subject}' ({name}): {label}"
+            )
+            return VERDICT_GENERIC
         return VERDICT_OK
 
     # 注意返回的是 UNKNOWN 而不是 OK：调用方需要知道这张图"没被验证过"，
@@ -251,11 +283,17 @@ def filter_clean_images(
     verdicts = {path: classify_image(path, video_subject) for path in image_paths}
     clean = [p for p, v in verdicts.items() if v == VERDICT_OK]
     watermarked = [p for p, v in verdicts.items() if v == VERDICT_WATERMARK]
+    generic = [p for p, v in verdicts.items() if v == VERDICT_GENERIC]
     unverified = [p for p, v in verdicts.items() if v == VERDICT_UNKNOWN]
 
     if watermarked:
         logger.info(
             f"visual_gate: dropped {len(watermarked)} watermarked/branded image(s)"
+        )
+    if generic:
+        logger.info(
+            f"visual_gate: dropped {len(generic)} generic image(s) that show "
+            f"nothing identifying '{video_subject}'"
         )
     if unverified:
         logger.warning(
@@ -268,8 +306,14 @@ def filter_clean_images(
         return clean
 
     if not clean:
-        # 相关性判断可能整体失灵，这时放行未被判定为水印的图，但绝不放行水印图。
-        return [p for p, v in verdicts.items() if v != VERDICT_WATERMARK]
+        # 相关性判断可能整体失灵时的兜底顺序：先用"没被判定为水印、也没被判定为
+        # 泛泛而谈"的图；实在一张都不剩，泛图也比没有强，但带水印的图永远不放行。
+        fallback = [
+            p
+            for p, v in verdicts.items()
+            if v not in (VERDICT_WATERMARK, VERDICT_GENERIC)
+        ]
+        return fallback or generic
     return clean + unverified
 
 
