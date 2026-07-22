@@ -147,6 +147,11 @@ def _ask_vision_provider(
         ],
         max_tokens=10,
         timeout=_REQUEST_TIMEOUT,
+        # 这是分类任务，不是创作任务。默认采样温度下，同一张图在不同调用里
+        # 会给出不同判定——实测同一张带 "MARVEL STUDIOS" 标题的宣传图，
+        # 这次判成 OK、下次判成 WATERMARK，于是"永远不用带水印素材"就成了
+        # 掷骰子。温度设为 0 让判定尽可能稳定可复现。
+        temperature=0,
         **extra,
     )
     return (response.choices[0].message.content or "").strip().upper()
@@ -414,6 +419,8 @@ def _ask_batch(content: List[dict], count: int) -> str | None:
                 messages=[{"role": "user", "content": content}],
                 max_tokens=20 * count + 40,
                 timeout=_REQUEST_TIMEOUT * 2,
+                # 同上：分类要的是稳定，不是多样性。
+                temperature=0,
                 **extra,
             )
             answer = (response.choices[0].message.content or "").strip()
