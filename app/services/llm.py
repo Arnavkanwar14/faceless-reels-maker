@@ -10,6 +10,7 @@ from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.utils import utils
 
 _max_retries = 5
 # Small stopword list used to extract the significant/subject words from a video
@@ -96,10 +97,16 @@ def _singular_forms(word: str) -> List[str]:
 
 
 def _term_contains_subject(term: str, subject_keywords: List[str]) -> bool:
-    """粗略匹配（含单复数）判断搜索词是否包含主体关键词，而不仅仅是抽象概念词。"""
+    """粗略匹配（含单复数）判断搜索词是否包含主体关键词，而不仅仅是抽象概念词。
+
+    两边都要转小写再比。之前只把 term 转了小写，keyword 保持原样，于是像
+    "GTA 6" 这种带大写的主体名永远匹配不上 "gta 6 gameplay"——判定为"不含
+    主体"之后又会在前面再拼一次主体，最终搜索词变成 "GTA 6 GTA 6 Gameplay"，
+    重复的词会同时拖累 YouTube 和图片搜索的结果质量。
+    """
     term_lower = term.lower()
     for keyword in subject_keywords:
-        if any(form in term_lower for form in _singular_forms(keyword)):
+        if any(form.lower() in term_lower for form in _singular_forms(keyword)):
             return True
     return False
 
@@ -1006,6 +1013,76 @@ Please note that you must use English for generating video search terms; Chinese
 
     logger.success(f"completed: \n{search_terms}")
     return search_terms
+
+
+def generate_sentence_visual_queries(
+    video_subject: str, video_script: str, video_source: str = "real_images"
+) -> List[str]:
+    """给旁白的每一句话各生成一个搜索词，顺序与句子一一对应。
+
+    generate_terms 出来的是一组"整条视频层面"的关键词，和某一句话具体在讲
+    什么没有关系——于是第 1 句在说双主角切换、画面却在放跑车，观众会觉得
+    图文不搭。而剪辑点本来就已经落在句子边界上了（见 task._get_sentence_
+    durations），素材按顺序铺进去时，只要关键词也按句子生成，画面就能跟着
+    旁白走。
+
+    返回的列表长度与句子数一致；解析失败时返回空列表，调用方回退到原来的
+    整体关键词，不影响既有流程。
+    """
+    sentences = [s.strip() for s in utils.split_string_by_punctuations(video_script) if s.strip()]
+    if not sentences:
+        return []
+
+    numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
+    prompt = f"""You are choosing B-roll for a short video about: {video_subject}
+
+Below are the narration sentences, in order. For EACH sentence, write one
+short image/video search query (3-6 words) for footage that visually matches
+what THAT sentence is saying.
+
+Rules:
+- every query must include the actual subject "{video_subject}" or its key noun,
+  so the results stay on-topic
+- describe something visible and concrete, not an abstract idea
+- prefer real footage/screenshots over posters or promotional art
+
+Return ONLY a JSON array of exactly {len(sentences)} strings, in the same order
+as the sentences. No other text.
+
+Sentences:
+{numbered}
+"""
+
+    try:
+        response = _generate_response(prompt=prompt)
+    except Exception as e:
+        logger.warning(f"failed to generate per-sentence visual queries: {e}")
+        return []
+
+    # 用 JSON 数组而不是"一行一个"：_generate_response 会把换行清掉，按行解析
+    # 时几条查询会黏成一整串，最后只剩一条。JSON 自带分隔符，不依赖换行存活。
+    queries: List[str] = []
+    match = re.search(r"\[.*\]", response or "", re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            queries = [str(q).strip() for q in parsed if str(q).strip()]
+        except (json.JSONDecodeError, TypeError):
+            queries = []
+
+    if len(queries) < len(sentences):
+        logger.warning(
+            f"per-sentence visual queries: got {len(queries)} for "
+            f"{len(sentences)} sentences, falling back to topic-level terms"
+        )
+        return []
+
+    queries = queries[: len(sentences)]
+    queries = _enforce_subject_in_terms(queries, video_subject, video_source)
+    logger.success(
+        f"generated {len(queries)} per-sentence visual queries for '{video_subject}'"
+    )
+    return queries
 
 
 # =============================================================================

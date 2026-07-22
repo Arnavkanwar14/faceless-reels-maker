@@ -65,16 +65,40 @@ def _generate_image(
         return False
 
 
+def _aspect_mismatch_ratio(image_path: str, width: int, height: int) -> float:
+    """源图长宽比和目标画幅差多少倍。1.0 表示完全一致。"""
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as img:
+            src_w, src_h = img.size
+    except Exception:
+        return 1.0
+    if not src_w or not src_h or not width or not height:
+        return 1.0
+    src_aspect = src_w / src_h
+    target_aspect = width / height
+    return max(src_aspect / target_aspect, target_aspect / src_aspect)
+
+
+# 长宽比差异超过这个倍数时，改用"模糊铺底 + 完整画面"而不是裁切填满。
+#
+# 把 16:9 的横图塞进 9:16 竖屏，填满式裁切只能保留大约 31% 的画面宽度，而且
+# 是闭着眼睛从正中间裁——主体稍微偏一点就被切没了，剩下的部分还要再放大
+# 1.78 倍，本来清晰的图也会被放糊。这正是"选出来的图看着啥也没有、还很糊"
+# 的直接原因。视频素材那条路早就改成模糊铺底了（见 video.py 的
+# _make_blurred_fill_background），静态图这里一直还在做破坏性裁切。
+_MAX_CROP_ASPECT_MISMATCH = 1.35
+
+
 def image_to_ken_burns_clip(
     image_path: str, output_path: str, duration: int, width: int, height: int
 ) -> bool:
     """用 ffmpeg zoompan 把静态图片转成带缓慢推进效果的短视频片段。
 
-    源图片尺寸/长宽比可能和目标画幅完全不同（尤其是网上下载的真实图片，
-    不像 AI 生成图那样能控制尺寸），所以必须先用
-    force_original_aspect_ratio=increase + crop 把图片"填满再裁切"到目标
-    画幅，再进入 zoompan。任何一步只用 scale 而不裁切，都会在长宽比不匹配
-    时把图片拉伸变形。
+    长宽比接近目标画幅时，走"填满再裁切"，裁掉的只是一点边缘；差得多时
+    （典型的横图进竖屏）改成"完整画面居中 + 自身模糊放大铺底"，保证画面
+    内容一张不少地呈现出来，而不是只剩中间三分之一。
     """
     ffmpeg_binary = utils.get_ffmpeg_binary()
     fps = 30
@@ -86,13 +110,32 @@ def image_to_ken_burns_clip(
         frames=total_frames, w=width, h=height, fps=fps
     )
 
-    filter_complex = (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},"
-        f"scale={zoom_w}:{zoom_h},"
-        f"{zoompan_expr},"
-        "format=yuv420p"
-    )
+    if _aspect_mismatch_ratio(image_path, width, height) <= _MAX_CROP_ASPECT_MISMATCH:
+        filter_complex = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},"
+            f"scale={zoom_w}:{zoom_h},"
+            f"{zoompan_expr},"
+            "format=yuv420p"
+        )
+    else:
+        # 前景：完整画面按比例缩放进画幅内（decrease，不裁切）。
+        # 背景：同一张图放大铺满后高斯模糊，垫在前景后面填掉上下空白。
+        # 两者叠加后再统一走 zoompan，运镜作用在合成结果上而不是原图，
+        # 前景不会在推进过程中被推出画外。
+        filter_complex = (
+            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},gblur=sigma=20[bg];"
+            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,"
+            f"scale={zoom_w}:{zoom_h},"
+            f"{zoompan_expr},"
+            "format=yuv420p"
+        )
+
+    # 模糊铺底那条分支用到了具名流（[bg]/[fg]），必须走 -filter_complex；
+    # 简单裁切分支是单链滤镜，-vf 就够了。
+    filter_flag = "-filter_complex" if "[bg]" in filter_complex else "-vf"
 
     cmd = [
         ffmpeg_binary,
@@ -100,7 +143,7 @@ def image_to_ken_burns_clip(
         "-loop", "1",
         "-i", image_path,
         "-t", str(duration),
-        "-vf", filter_complex,
+        filter_flag, filter_complex,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         output_path,

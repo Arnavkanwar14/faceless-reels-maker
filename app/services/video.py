@@ -88,6 +88,39 @@ _SUPPORTED_VIDEO_CODECS = (
 )
 _runtime_disabled_video_codecs = set()
 
+# 成片要经过三次编码：每段素材各写一次临时文件 -> 拼接成一条 -> 叠字幕和
+# 音频写出最终文件。三次都不指定质量参数的话，走的是 libx264 的默认 CRF 23，
+# 而每一代有损压缩的损失都会叠加到下一代上——观众最后看到的是被压了三轮的
+# 画面，这也是"明明源图很清晰、成片却发糊"的一个隐性来源。
+#
+# 中间产物用接近无损的 CRF 16：文件更大但只存在于临时目录，换来的是后续
+# 环节拿到的输入几乎没有损失。preset 用 veryfast，因为质量已经由低 CRF 保证，
+# 没必要在中间环节花时间做精细搜索。
+# 最终成片用 CRF 18 + 更慢的 preset：把编码预算集中花在唯一会被观众看到的
+# 这一次上。平台还会再压一次，交给它一个干净的母版能明显减少二次压缩的损失。
+_INTERMEDIATE_X264_PARAMS = ["-crf", "16", "-preset", "veryfast"]
+_FINAL_X264_PARAMS = [
+    "-crf", "18",
+    "-preset", "slow",
+    "-profile:v", "high",
+    "-movflags", "+faststart",
+    # 明确标注色彩空间，避免播放器/平台按不同默认值解读导致偏色。
+    "-colorspace", "bt709",
+    "-color_primaries", "bt709",
+    "-color_trc", "bt709",
+]
+
+
+def _x264_params(codec: str, final: bool) -> dict:
+    """只在使用 libx264 时附加质量参数。
+
+    硬件编码器（nvenc/amf/qsv 等）不认 -crf/-preset 这套参数，硬塞会直接
+    让编码失败，所以这里按编码器区分，非 libx264 时返回空配置。
+    """
+    if codec != _DEFAULT_VIDEO_CODEC:
+        return {}
+    return {"ffmpeg_params": _FINAL_X264_PARAMS if final else _INTERMEDIATE_X264_PARAMS}
+
 
 def _get_required_video_duration(audio_duration: float) -> float:
     """
@@ -345,6 +378,10 @@ def concat_video_clips_with_ffmpeg(
             "-pix_fmt",
             "yuv420p",
         ]
+        # 拼接同样是中间产物（后面还要叠字幕再编一次），用接近无损的参数，
+        # 不要在这一步就把画质压掉一截。
+        if codec == _DEFAULT_VIDEO_CODEC:
+            command.extend(_INTERMEDIATE_X264_PARAMS)
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
         command.append(output_file)
@@ -817,12 +854,16 @@ def combine_videos(
 
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            _clip_codec = _get_configured_video_codec()
             _write_videofile_with_codec_fallback(
                 clip,
                 clip_file,
-                codec=_get_configured_video_codec(),
+                codec=_clip_codec,
                 logger=None,
                 fps=fps,
+                # 中间产物，用接近无损的参数，别让后面两轮编码在已经掉过
+                # 一次质量的画面上继续压。
+                **_x264_params(_clip_codec, final=False),
             )
 
             # Store clip duration before closing
@@ -1623,13 +1664,17 @@ def generate_video(
     # 显式沿用输入音频的采样率；如果取不到，再回退到 MoviePy 默认的 44100Hz。
     # 这样可以减少不同运行环境，尤其是 Docker 环境中再次重采样带来的音质波动。
     output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+    _final_codec = _get_configured_video_codec()
     _write_videofile_with_codec_fallback(
         video_clip,
         output_file=output_file,
-        codec=_get_configured_video_codec(),
+        codec=_final_codec,
         audio_codec=audio_codec,
         audio_fps=output_audio_fps,
         audio_bitrate=audio_bitrate,
+        # 唯一会被观众看到的一次编码，把预算花在这里：更慢的 preset、
+        # 明确的色彩标注、faststart 便于网页端边下边播。
+        **_x264_params(_final_codec, final=True),
         temp_audiofile_path=_get_temp_audio_dir(output_dir),
         threads=params.n_threads or 2,
         logger=None,

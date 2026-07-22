@@ -50,18 +50,33 @@ def generate_script(task_id, params):
 def generate_terms(task_id, params, video_script, video_source=None, subject_classification=None):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
+    effective_source = (
+        video_source if video_source is not None else params.video_source
+    )
     if not video_terms:
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
         # 无法改善“后面内容的画面提前出现”的问题。
-        video_terms = llm.generate_terms(
-            video_subject=params.video_subject,
-            video_script=video_script,
-            amount=8 if params.match_materials_to_script else 5,
-            match_script_order=params.match_materials_to_script,
-            video_source=video_source if video_source is not None else params.video_source,
-            subject_classification=subject_classification,
-        )
+        #
+        # 剪辑点已经落在句子边界上，素材也按顺序铺，所以关键词精确到"每句
+        # 话一个"时，画面才真的跟着旁白在讲的内容走，而不只是笼统地贴合
+        # 整个主题。
+        if params.match_materials_to_script:
+            video_terms = llm.generate_sentence_visual_queries(
+                video_subject=params.video_subject,
+                video_script=video_script,
+                video_source=effective_source,
+            )
+
+        if not video_terms:
+            video_terms = llm.generate_terms(
+                video_subject=params.video_subject,
+                video_script=video_script,
+                amount=8 if params.match_materials_to_script else 5,
+                match_script_order=params.match_materials_to_script,
+                video_source=effective_source,
+                subject_classification=subject_classification,
+            )
     else:
         if isinstance(video_terms, str):
             video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]

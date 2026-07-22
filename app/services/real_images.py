@@ -28,6 +28,7 @@ keywords but doesn't actually show the subject.
 from __future__ import annotations
 
 import os
+import subprocess
 from typing import List
 
 import requests
@@ -52,6 +53,12 @@ _MIN_LONG_SIDE = 1000
 _MIN_SOURCE_SHORT_SIDE = 600
 _MAX_ASPECT_RATIO = 2.5  # long_side / short_side above this gets rejected
 _IMAGES_PER_TERM = 2
+# 候选池要比实际需要的张数多几倍，择优才有意义：过完清晰度、水印、拼图
+# 几道闸之后能留下的通常只是少数，池子太浅就退化回"有什么用什么"。
+_POOL_OVERSAMPLE = 4
+# 感知哈希汉明距离阈值，超过这个距离才算不同的画面。海报类素材被各站转载后
+# 往往只有轻微的压缩/裁切差异，阈值太小会漏判成"不同的图"。
+_DUPLICATE_HAMMING_THRESHOLD = 6
 _FRAMES_TO_SAMPLE_PER_TERM = _IMAGES_PER_TERM * 3  # extra headroom for quality gate rejects
 _DOWNLOAD_TIMEOUT = 20
 _MAX_IMAGE_BYTES = 15 * 1024 * 1024
@@ -141,15 +148,33 @@ def _ddgs_image_candidates(search_term: str, video_subject: str) -> List[str]:
         logger.warning("real_images: ddgs package not installed, skipping web image search")
         return []
 
-    query = f"{search_term} {video_subject}".strip()
-    try:
-        with DDGS() as ddgs:
-            # 多要一些结果——下面按来源和标题过滤掉的比例很高，要不然过完
-            # 一轮就没剩几张可用的了。
-            results = list(ddgs.images(query, max_results=25, size="Large"))
-    except Exception as e:
-        logger.debug(f"real_images: ddgs search failed for '{query}': {e}")
-        return []
+    # 同一个主题用几种问法各搜一轮。
+    #
+    # 原因有两个：一是过滤掉的比例很高（域名黑名单、清晰度、海报/拼图判定
+    # 层层筛完，一轮搜索经常只剩下个位数候选，池子太浅就退化成"有什么用
+    # 什么"）；二是不加限定词的搜索，返回的大多是海报和宣传图——加上
+    # "screenshot"、"gameplay" 这类词，才更容易搜到真实画面。
+    base_query = f"{search_term} {video_subject}".strip()
+    queries = [
+        base_query,
+        f"{search_term} screenshot",
+        f"{video_subject} gameplay screenshot"
+        if "game" in video_subject.lower()
+        else f"{video_subject} scene still",
+    ]
+
+    results = []
+    seen_urls = set()
+    for query in queries:
+        try:
+            with DDGS() as ddgs:
+                for r in ddgs.images(query, max_results=20, size="Large"):
+                    url = r.get("image")
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        results.append(r)
+        except Exception as e:
+            logger.debug(f"real_images: ddgs search failed for '{query}': {e}")
 
     subject_keywords = material._extract_subject_keywords(video_subject)
 
@@ -193,9 +218,9 @@ def _ddgs_image_candidates(search_term: str, video_subject: str) -> List[str]:
 
     if blocked_source or blocked_title or off_topic:
         logger.info(
-            f"real_images: ddg '{query}' -> {len(urls)} usable "
-            f"(dropped {blocked_source} watermarked/branded sources, "
-            f"{blocked_title} by title, {off_topic} off-topic)"
+            f"real_images: ddg '{base_query}' ({len(queries)} query variants) -> "
+            f"{len(urls)} usable (dropped {blocked_source} watermarked/branded "
+            f"sources, {blocked_title} by title, {off_topic} off-topic)"
         )
     return urls
 
@@ -261,6 +286,89 @@ def _has_usable_source_resolution(image_path: str) -> bool:
     return True
 
 
+def _clip_short_side(clip_path: str) -> int:
+    """读出视频片段的短边像素数，用来判断这段素材值不值得用。"""
+    try:
+        result = subprocess.run(
+            [
+                utils.get_ffmpeg_binary().replace("ffmpeg", "ffprobe"),
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0",
+                clip_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        width, height = (int(v) for v in result.stdout.strip().split(",")[:2])
+        return min(width, height)
+    except Exception:
+        # ffprobe 可能不在 imageio-ffmpeg 的分发包里，退回用 moviepy 读。
+        try:
+            from moviepy.video.io.VideoFileClip import VideoFileClip
+
+            with VideoFileClip(clip_path) as clip:
+                return min(clip.size)
+        except Exception as e:
+            logger.debug(f"real_images: could not read size of {clip_path}: {e}")
+            return 0
+
+
+def _collect_motion_clips(
+    search_terms: List[str],
+    video_subject: str,
+    output_dir: str,
+    needed: int,
+    clip_duration: int,
+) -> List[str]:
+    """从主体最相关的那条视频里切出真实动态片段。
+
+    分辨率不达标时整批放弃——低清动态片段和低清截图一样不能用，而且这种
+    情况下回退到网页图片搜索通常还能捞到能用的图。
+    """
+    clips: List[str] = []
+    for term in search_terms:
+        if len(clips) >= needed:
+            break
+
+        video = material.find_best_youtube_video(term, video_subject, minimum_duration=10)
+        if not video:
+            continue
+
+        fetched = material.fetch_topic_segment(
+            video["video_id"], video["url"], video["duration"], output_dir
+        )
+        if not fetched:
+            continue
+        local_path, seg_duration = fetched
+
+        short_side = _clip_short_side(local_path)
+        if short_side and short_side < _MIN_SOURCE_SHORT_SIDE:
+            logger.info(
+                f"real_images: '{video['title'][:50]}' segment came back at "
+                f"{short_side}px short side - too low to use as motion footage"
+            )
+            continue
+
+        clips.extend(
+            material.extract_motion_clips(
+                local_path,
+                seg_duration,
+                output_dir,
+                video["video_id"],
+                count=needed - len(clips),
+                clip_duration=clip_duration,
+            )
+        )
+
+    if clips:
+        # 动态片段同样要过一遍水印/相关性判定：搬运号的画面一样会压台标。
+        clips = visual_gate.filter_relevant_clips(clips, video_subject)
+    return clips
+
+
 def _collect_video_screenshot_candidates(
     term: str, video_subject: str, output_dir: str
 ) -> tuple[List[str], str]:
@@ -306,14 +414,9 @@ def _collect_ddg_candidates(term: str, video_subject: str, output_dir: str) -> L
         ):
             image_paths.append(image_path)
 
-    image_paths = quality_gate.filter_low_quality_images(image_paths)
-    # 域名黑名单挡不住的那一类：新闻/博客站自己做的文章头图，同样会带站点
-    # logo 和大标题——形式上和视频封面图没有区别。这类只能看图本身才认得
-    # 出来，所以在这里过一遍视觉检查，在还只是一张图的时候就把它丢掉。
-    # strict=True：网络搜到的图是最容易带台标/大标题的来源，一旦没法核实
-    # 就直接跳过。真正相关的画面还可以从正片抽帧那条路补上，不值得为了凑
-    # 数把无法核实的图放进成片。
-    return visual_gate.filter_clean_images(image_paths, video_subject, strict=True)
+    # 视觉检查放到调用方统一批量做——两个来源的候选先汇成一个池子，再一次性
+    # 判定，配额按批次消耗而不是按张。
+    return quality_gate.filter_low_quality_images(image_paths)
 
 
 def download_real_image_clips(
@@ -325,76 +428,166 @@ def download_real_image_clips(
     max_clip_duration: int = 5,
     material_directory: str = "",
 ) -> List[str]:
-    """为每个搜索词找真实图片素材（优先：主体相关视频截图；补充：DDG 图片
-    搜索），转成 Ken Burns 短片段，直到覆盖音频时长或用完关键词。"""
+    """先把两个来源的候选图汇成一个池子，统一打分排序，再挑最好的几张转成
+    Ken Burns 片段。
+
+    之前是"逐个关键词、按搜索引擎给的顺序、取前两张能过闸的"——搜索结果
+    的排序是按引擎的相关性算的，和画面好不好看没有关系，于是排在第 8 位的
+    好图永远没机会出场，因为名额早被第 4、第 6 位填满了。改成先攒池子再
+    择优，才能真正"挑出最合适的"，而不是"碰到的头两张"。
+    """
     width, height = video_aspect.to_resolution()
     output_dir = material_directory or utils.storage_dir("cache_videos")
     os.makedirs(output_dir, exist_ok=True)
 
-    video_paths = []
-    seen_hashes = set()
-    total_duration = 0.0
+    needed = max(1, int(audio_duration / max_clip_duration + 0.999)) if audio_duration else 1
 
+    # ---- 0. 真实动态片段优先 ----
+    #
+    # 静态图配 Ken Burns 推镜说到底是在模拟运动，真实素材本身的运动永远更好
+    # 看。而且对还没上映的电影/还没发售的游戏这类主题，网上能搜到的图基本
+    # 全是海报和同人图——真正的画面只存在于预告片里，网页图片搜索这条路
+    # 天然拿不到。下载片段本来就是抽帧要做的事，顺手切成动态片段几乎零成本。
+    motion_clips = _collect_motion_clips(
+        search_terms, video_subject, output_dir, needed, max_clip_duration
+    )
+    if len(motion_clips) >= needed:
+        logger.success(
+            f"real_images: using {len(motion_clips)} real motion clips "
+            "(better than stills, no Ken Burns needed)"
+        )
+        return motion_clips[:needed]
+
+    still_slots_needed = needed - len(motion_clips)
+    if motion_clips:
+        logger.info(
+            f"real_images: got {len(motion_clips)} motion clip(s), filling the "
+            f"remaining {still_slots_needed} slot(s) with stills"
+        )
+
+    # ---- 1. 汇集候选：两个来源都收，不再是"截图不够才去搜图" ----
+    pool: List[tuple[str, str]] = []
+    seen_files = set()
     for term in search_terms:
-        if total_duration >= audio_duration and video_paths:
-            logger.info(
-                f"real_images: total duration {total_duration:.1f}s covers audio, "
-                "skip remaining terms"
-            )
+        for path in _collect_video_screenshot_candidates(term, video_subject, output_dir)[0]:
+            if path not in seen_files:
+                seen_files.add(path)
+                pool.append((path, f"video screenshot ({term})"))
+        for path in _collect_ddg_candidates(term, video_subject, output_dir):
+            if path not in seen_files:
+                seen_files.add(path)
+                pool.append((path, f"web image search ({term})"))
+        # 池子够深就不用把每个关键词都跑一遍——再往下收益递减，只是徒增
+        # 下载和判定的时间。
+        if len(pool) >= needed * _POOL_OVERSAMPLE:
             break
 
-        screenshot_candidates, source_title = _collect_video_screenshot_candidates(
-            term, video_subject, output_dir
+    if not pool:
+        logger.warning("real_images: no usable candidates found from any source")
+        return []
+
+    # ---- 2. 本地打分（免费）：清晰度排序 + 跨来源感知哈希去重 ----
+    scored = []
+    for path, source in pool:
+        sharpness = quality_gate.normalized_sharpness(path) or 0.0
+        scored.append((sharpness, path, source))
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    # 同一个主题在不同来源、不同关键词下经常搜到同一张（或几乎一样的）图，
+    # 尤其是官方海报这种被各家站点反复转载的素材。不跨来源去重的话，最后
+    # 挑出来的几张可能是同一张图的不同副本，成片看着就是同一个画面反复出现。
+    # 按清晰度从高到低遍历，保留每组近似图里最清晰的那张。
+    deduped = []
+    kept_hashes = []
+    for sharpness, path, source in scored:
+        image = quality_gate._load_image(path)
+        if image is None:
+            deduped.append((sharpness, path, source))
+            continue
+        try:
+            image_hash = quality_gate._average_hash(image)
+        except Exception:
+            deduped.append((sharpness, path, source))
+            continue
+        if any(
+            quality_gate._hamming_distance(image_hash, kept) <= _DUPLICATE_HAMMING_THRESHOLD
+            for kept in kept_hashes
+        ):
+            logger.debug(
+                f"real_images: skipping near-duplicate {os.path.basename(path)}"
+            )
+            continue
+        kept_hashes.append(image_hash)
+        deduped.append((sharpness, path, source))
+
+    if len(deduped) < len(scored):
+        logger.info(
+            f"real_images: dropped {len(scored) - len(deduped)} near-duplicate "
+            "candidate(s) across sources"
         )
-        candidates = [(path, source_title) for path in screenshot_candidates]
+    scored = deduped
 
-        if len(candidates) < _IMAGES_PER_TERM:
-            ddg_candidates = _collect_ddg_candidates(term, video_subject, output_dir)
-            candidates += [(path, "DuckDuckGo image search") for path in ddg_candidates]
+    # ---- 3. 视觉判定：整池一次性批量判，配额按批次算 ----
+    ranked_paths = [path for _, path, _ in scored]
+    verdicts = visual_gate.classify_images_batch(ranked_paths, video_subject)
+    source_by_path = {path: source for _, path, source in scored}
 
-        accepted_for_term = 0
-        for image_path, source in candidates:
-            if accepted_for_term >= _IMAGES_PER_TERM:
-                break
+    usable = [p for p in ranked_paths if verdicts.get(p) == visual_gate.VERDICT_OK]
+    if not usable:
+        # 一张都没过时，放行"没被判定为水印/拼图"的，但带水印的绝不放回来。
+        usable = [
+            p
+            for p in ranked_paths
+            if verdicts.get(p)
+            not in (visual_gate.VERDICT_WATERMARK, visual_gate.VERDICT_GENERIC)
+        ]
+        if usable:
+            logger.warning(
+                "real_images: no candidate passed the full visual check, "
+                "falling back to the sharpest non-watermarked ones"
+            )
 
-            frame_hash = utils.md5(image_path)
-            if frame_hash in seen_hashes:
-                continue
+    logger.info(
+        f"real_images: pooled {len(pool)} candidates, {len(usable)} usable after "
+        f"scoring + visual check (need {needed})"
+    )
 
-            clip_path = os.path.join(output_dir, f"realimg-{task_id}-{frame_hash}.mp4")
-            if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
-                video_paths.append(clip_path)
-                seen_hashes.add(frame_hash)
-                accepted_for_term += 1
-                total_duration += max_clip_duration
-                continue
+    # ---- 4. 择优渲染 ----
+    video_paths = []
+    for image_path in usable:
+        if len(video_paths) >= needed:
+            break
 
-            # 先裁边再放大：台标/角标/信箱黑边都贴着画面边缘，趁放大之前裁掉，
-            # 既不浪费算力去放大注定要丢的像素，也避免把水印一起放大。
-            crop_borders(image_path)
+        frame_hash = utils.md5(image_path)
+        clip_path = os.path.join(output_dir, f"realimg-{task_id}-{frame_hash}.mp4")
+        if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+            video_paths.append(clip_path)
+            continue
 
-            # 真实图片（视频截图或网络搜索结果）分辨率不像 AI 生成图那样可控，
-            # 放大到目标画幅前先补一次分辨率；图片本身已经够大时函数会直接
-            # 跳过。分辨率门槛放在放大之后检查，而不是放大之前——否则一张
-            # 内容完全相关但来源画质偏低的图会被直接拒绝，明明放大后完全够用。
-            upscaled_path = upscale.maybe_upscale_image(image_path)
-            try:
-                with Image.open(upscaled_path) as upscaled_img:
-                    upscaled_width, upscaled_height = upscaled_img.size
-            except Exception as e:
-                logger.debug(f"real_images: failed to read '{upscaled_path}': {e}")
-                continue
-            if not _passes_dimension_gate(upscaled_width, upscaled_height):
-                continue
+        # 先裁边再放大：台标/角标/信箱黑边都贴着画面边缘，趁放大之前裁掉，
+        # 既不浪费算力去放大注定要丢的像素，也避免把水印一起放大。
+        crop_borders(image_path)
 
-            if ai_visuals.image_to_ken_burns_clip(
-                upscaled_path, clip_path, max_clip_duration, width, height
-            ):
-                video_paths.append(clip_path)
-                seen_hashes.add(frame_hash)
-                accepted_for_term += 1
-                total_duration += max_clip_duration
-                logger.info(f"real_images: got clip for '{term}' from {source}")
+        # 真实图片（视频截图或网络搜索结果）分辨率不像 AI 生成图那样可控，
+        # 放大到目标画幅前先补一次分辨率；图片本身已经够大时函数会直接跳过。
+        upscaled_path = upscale.maybe_upscale_image(image_path)
+        try:
+            with Image.open(upscaled_path) as upscaled_img:
+                upscaled_width, upscaled_height = upscaled_img.size
+        except Exception as e:
+            logger.debug(f"real_images: failed to read '{upscaled_path}': {e}")
+            continue
+        if not _passes_dimension_gate(upscaled_width, upscaled_height):
+            continue
+
+        if ai_visuals.image_to_ken_burns_clip(
+            upscaled_path, clip_path, max_clip_duration, width, height
+        ):
+            video_paths.append(clip_path)
+            logger.info(
+                f"real_images: selected {os.path.basename(image_path)} from "
+                f"{source_by_path.get(image_path, 'unknown source')}"
+            )
 
     logger.success(f"real_images: generated {len(video_paths)} clips from real images")
     return video_paths

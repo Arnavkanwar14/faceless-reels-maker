@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import re
 import subprocess
 from typing import List
 
@@ -253,6 +254,174 @@ def classify_image(image_path: str, video_subject: str) -> str:
     return _classify_data_uri(
         _encode_image_file(image_path), video_subject, os.path.basename(image_path)
     )
+
+
+_BATCH_SIZE = 8
+_GROQ_MAX_IMAGES_PER_REQUEST = 3
+
+
+def _parse_batch_answer(answer: str, count: int) -> List[str] | None:
+    """从模型回答里解出每张图的判定。解析不出来返回 None，由调用方回退。"""
+    verdict_by_token = {
+        "WATERMARK": VERDICT_WATERMARK,
+        # 拼图和海报都归到"不能当独立镜头用"这一类：它们本身不违规，但都不是
+        # 我们要的真实画面。放在 GENERIC 桶里，兜底逻辑就不会把它们捞回来。
+        "COLLAGE": VERDICT_GENERIC,
+        "POSTER": VERDICT_GENERIC,
+        "GENERIC": VERDICT_GENERIC,
+        "UNRELATED": VERDICT_UNRELATED,
+        "OK": VERDICT_OK,
+    }
+
+    # 期望形如 "1:OK 2:WATERMARK 3:GENERIC"，但模型可能加上换行、逗号或者
+    # 编号后的空格，所以用正则按 "序号 + 判定词" 成对提取，容错性更好。
+    found = re.findall(r"(\d+)\s*[:.\)-]\s*([A-Z]+)", answer.upper())
+    if not found:
+        return None
+
+    verdicts: List[str] = [VERDICT_UNKNOWN] * count
+    for index_text, token in found:
+        try:
+            index = int(index_text) - 1
+        except ValueError:
+            continue
+        if 0 <= index < count and token in verdict_by_token:
+            verdicts[index] = verdict_by_token[token]
+    return verdicts
+
+
+def classify_images_batch(
+    image_paths: List[str], video_subject: str
+) -> dict[str, str]:
+    """一次调用判定多张图片，返回 {路径: 判定}。
+
+    逐张调用意味着几十张图就是几十次请求，Groq 免费额度一天只够 ~80 次，
+    素材稍微多一点当天就再也检查不了了。把多张图放进同一次请求里，配额
+    消耗和延迟都按批次算而不是按张算。
+
+    批次解析失败时回退到逐张判定，保证结果始终可用。
+    """
+    verdicts: dict[str, str] = {}
+    if not image_paths:
+        return verdicts
+
+    providers_available = config.app.get("groq_api_key", "") or config.app.get(
+        "gemini_vision_api_key", ""
+    )
+    if not providers_available:
+        return {path: VERDICT_UNKNOWN for path in image_paths}
+
+    for start in range(0, len(image_paths), _BATCH_SIZE):
+        batch = image_paths[start : start + _BATCH_SIZE]
+        data_uris = [_encode_image_file(p) for p in batch]
+        if any(uri is None for uri in data_uris):
+            for path in batch:
+                verdicts[path] = classify_image(path, video_subject)
+            continue
+
+        content: List[dict] = [
+            {"type": "text", "text": _build_batch_prompt(video_subject, len(batch))}
+        ]
+        for uri in data_uris:
+            content.append({"type": "image_url", "image_url": {"url": uri}})
+
+        answer = _ask_batch(content, len(batch))
+        parsed = _parse_batch_answer(answer or "", len(batch))
+        if parsed is None:
+            logger.debug(
+                "visual_gate: batch answer unparseable, falling back to per-image checks"
+            )
+            for path in batch:
+                verdicts[path] = classify_image(path, video_subject)
+            continue
+
+        for path, verdict in zip(batch, parsed):
+            verdicts[path] = verdict
+            if verdict == VERDICT_WATERMARK:
+                logger.info(
+                    f"visual_gate: rejected for watermark/branding: "
+                    f"{os.path.basename(path)}"
+                )
+            elif verdict == VERDICT_GENERIC:
+                logger.info(
+                    f"visual_gate: rejected as generic/collage: {os.path.basename(path)}"
+                )
+            elif verdict == VERDICT_UNRELATED:
+                logger.info(
+                    f"visual_gate: rejected as unrelated to '{video_subject}': "
+                    f"{os.path.basename(path)}"
+                )
+
+    return verdicts
+
+
+def _build_batch_prompt(video_subject: str, count: int) -> str:
+    return (
+        f"You are given {count} candidate images, in order, for a video about "
+        f"'{video_subject}'.\n\n"
+        "Judge EACH image independently and assign exactly one verdict:\n"
+        "WATERMARK - carries third-party branding baked in: a watermark, site "
+        "or channel logo, TV network bug, username/@handle, 'SUBSCRIBE' prompt, "
+        "or a large overlaid headline/title treatment. Check corners and edges.\n"
+        "COLLAGE - not one single photo but a grid, montage, split-screen or "
+        "side-by-side built from several images.\n"
+        "POSTER - promotional art rather than real footage: a movie/game "
+        "poster, key art, box art, cover, or any composed promotional image "
+        "with a title logo or character line-up. This includes official "
+        "posters and fan-made ones. We want actual footage or screenshots, "
+        "not marketing art.\n"
+        "UNRELATED - shows something clearly belonging to a different subject.\n"
+        "GENERIC - plausibly on-topic but shows nothing that identifies this "
+        "specific subject (an ordinary vehicle, building, street, sky or "
+        "landscape that could be from anywhere, or a close-up too tight to "
+        "tell what it is).\n"
+        "OK - a single unbroken frame of real footage, a gameplay/screen "
+        "capture, or a candid photo showing something specific and "
+        f"recognisable about '{video_subject}'.\n\n"
+        f"Reply with exactly {count} lines, nothing else, in this form:\n"
+        "1:VERDICT\n2:VERDICT\n...\n"
+        f"Use the image order given. Output {count} lines."
+    )
+
+
+def _ask_batch(content: List[dict], count: int) -> str | None:
+    """按 groq -> gemini 的顺序尝试同一个批次请求。"""
+    groq_key = config.app.get("groq_api_key", "")
+    gemini_key = config.app.get("gemini_vision_api_key", "")
+
+    providers = []
+    # Groq 单次请求最多只接受 3 张图，超过会直接 400。批次比这大时干脆不试，
+    # 省掉一次注定失败的往返。
+    if groq_key and count <= _GROQ_MAX_IMAGES_PER_REQUEST:
+        providers.append((
+            "groq", groq_key, _GROQ_BASE_URL,
+            config.app.get("groq_vision_model_name", "") or _DEFAULT_VISION_MODEL,
+            {"reasoning_effort": "none"},
+        ))
+    if gemini_key:
+        providers.append((
+            "gemini", gemini_key, _GEMINI_BASE_URL,
+            config.app.get("gemini_vision_model_name", "")
+            or _DEFAULT_GEMINI_VISION_MODEL,
+            {},
+        ))
+
+    for name, key, base_url, model, extra in providers:
+        try:
+            client = OpenAI(api_key=key, base_url=base_url)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=20 * count + 40,
+                timeout=_REQUEST_TIMEOUT * 2,
+                **extra,
+            )
+            answer = (response.choices[0].message.content or "").strip()
+            if answer:
+                return answer
+        except Exception as e:
+            logger.debug(f"visual_gate: batch check failed on {name}: {e}")
+    return None
 
 
 def filter_clean_images(

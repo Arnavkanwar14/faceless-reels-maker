@@ -469,8 +469,11 @@ def _download_youtube_clip_1080p(
         "-i", video_source_url,
         "-t", f"{duration:.3f}",
         "-an",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
+        # 直接流拷贝，不重新编码。原本这里转一遍 libx264，既慢又白白多掉一代
+        # 画质——素材后面还要经过合成和成片两轮编码，没有理由在下载阶段就先
+        # 压一次。实测同一段素材：转码要 82s，流拷贝拿 30s 的片段也只要 96s，
+        # 时间几乎全花在连接和拉流上，和片段长度关系不大。
+        "-c", "copy",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -524,6 +527,46 @@ def _download_youtube_clip_progressive_fallback(
     return os.path.exists(output_path) and os.path.getsize(output_path) > 0
 
 
+# 频道名里出现这些词，基本可以认为是一手来源（发行方/制作方的官方频道）。
+# 刻意不放 "tv"/"channel" 这种词——它们在新闻台和搬运号里同样常见，区分不出来。
+_OFFICIAL_SOURCE_MARKERS = (
+    "official", "originals", "studios", "games", "entertainment", "pictures",
+    "records",
+)
+# 媒体/娱乐新闻台。它们发的是自己重新剪过、压了台标的版本——ET 那条带
+# "ET" 角标的预告片就是从这类频道来的。名字里往往也含 "entertainment"，
+# 所以必须显式列出来，靠通用词区分不开（Marvel Entertainment 是官方，
+# Entertainment Tonight 不是）。
+_BROADCASTER_MARKERS = (
+    "tonight", "cnn", "bbc", "fox", "nbc", "abc news", "cbs", "tmz", "variety",
+    "access hollywood", "extra tv", "e! news", "hollywood reporter", "deadline",
+    "ign", "gamespot", "screenrant", "collider", "gamesradar",
+)
+# 典型的搬运/解说/二创号——画面上大概率压着自己的台标、大字标题或者摄像头小窗。
+_DERIVATIVE_SOURCE_MARKERS = (
+    "reaction", "react", "breakdown", "explained", "theory", "leak", "leaks",
+    "news", "daily", "updates", "fan", "edit", "compilation", "top 10", "top10",
+    "everything", "you missed", "recap",
+) + _BROADCASTER_MARKERS
+
+
+def _official_source_rank(uploader: str, title: str) -> int:
+    """给来源打个排序用的档位，越小越优先。
+
+    0 = 频道名看着像官方/一手来源
+    1 = 看不出来（中性）
+    2 = 明显是搬运/解说/二创
+    """
+    channel = (uploader or "").lower()
+    combined = f"{channel} {(title or '').lower()}"
+
+    if any(marker in combined for marker in _DERIVATIVE_SOURCE_MARKERS):
+        return 2
+    if any(marker in channel for marker in _OFFICIAL_SOURCE_MARKERS):
+        return 0
+    return 1
+
+
 def find_best_youtube_video(
     search_term: str, video_subject: str, minimum_duration: int = 0
 ) -> dict | None:
@@ -553,6 +596,7 @@ def find_best_youtube_video(
         logger.error(f"youtube search failed for '{search_term}': {e}")
         return None
 
+    matches = []
     for entry in entries:
         if not entry:
             continue
@@ -563,12 +607,31 @@ def find_best_youtube_video(
             continue
         if subject_keywords and not _text_matches_subject(title, subject_keywords):
             continue
-        return {
+        matches.append({
             "video_id": video_id,
             "title": title,
             "duration": duration,
+            "uploader": entry.get("uploader") or entry.get("channel") or "",
             "url": f"https://www.youtube.com/watch?v={video_id}",
-        }
+        })
+
+    if not matches:
+        logger.info(
+            f"youtube: no title-relevant results for '{search_term}' "
+            f"(subject keywords: {subject_keywords})"
+        )
+        return None
+
+    # 标题相关的结果里优先选官方/一手来源。搬运号和解说号的画面上通常压着
+    # 自己的台标和大字标题，而且往往是二压过的糊画质；官方频道放出来的是
+    # 原始素材。之前直接取第一条，等于把这个选择权交给了 YouTube 的排序。
+    matches.sort(key=lambda m: _official_source_rank(m["uploader"], m["title"]))
+    best = matches[0]
+    if best["uploader"]:
+        logger.info(
+            f"youtube: picked '{best['title']}' from channel '{best['uploader']}'"
+        )
+    return best
 
     logger.info(
         f"youtube: no title-relevant results for '{search_term}' "
@@ -629,6 +692,97 @@ def search_and_download_youtube_clip(
     return ""
 
 
+def fetch_topic_segment(
+    video_id: str,
+    video_url: str,
+    duration: float,
+    output_dir: str,
+    # 30s 足够切出 6 段 5s 的动态素材，而且实测拉 30s 和拉 15s 的耗时几乎
+    # 一样（96s vs 86s，时间基本都花在建连接和拉流上）。之前默认 60s 反而
+    # 经常超时，超时就回退到 360p 渐进流——拉得更多，结果却更差。
+    segment_seconds: int = 30,
+) -> tuple[str, float] | None:
+    """把一条已验证主体相关的视频的中段拉到本地，返回 (本地路径, 片段时长)。
+
+    截图和动态片段都从这一个本地文件里切，避免为了两种用途分别下载两次。
+    已经下载过的直接复用。
+    """
+    if duration <= 0:
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    margin = duration * 0.1
+    seg_start = margin
+    seg_end = min(duration - margin, seg_start + segment_seconds)
+    if seg_end - seg_start < 5:
+        seg_start, seg_end = 0, min(duration, segment_seconds)
+
+    local_path = os.path.join(output_dir, f"ssbase-{video_id}.mp4")
+    if not (os.path.exists(local_path) and os.path.getsize(local_path) > 0):
+        if not _download_youtube_segment(video_url, seg_start, seg_end, local_path):
+            return None
+
+    return local_path, seg_end - seg_start
+
+
+def extract_motion_clips(
+    local_path: str,
+    segment_duration: float,
+    output_dir: str,
+    video_id: str,
+    count: int = 4,
+    clip_duration: int = 5,
+) -> List[str]:
+    """从已经下载到本地的片段里，均匀切出若干条短的动态片段。
+
+    真实的动态画面永远比"静态图 + Ken Burns 推镜"更有说服力——推镜只是在
+    模拟运动，而这里就是原始素材本身。片段本来就已经为抽帧下载好了，切成
+    动态片段几乎是白捡的，不需要任何额外下载。
+
+    用流拷贝（-c copy）切割：不重新编码，既快又不会引入额外的画质损失。
+    """
+    if segment_duration <= 0 or count <= 0:
+        return []
+
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    usable = max(0.0, segment_duration - clip_duration)
+    clip_paths = []
+
+    for i in range(count):
+        start = (usable * i / count) if count > 1 else 0.0
+        clip_path = os.path.join(output_dir, f"ssclip-{video_id}-{i}.mp4")
+        if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
+            clip_paths.append(clip_path)
+            continue
+        cmd = [
+            ffmpeg_binary, "-y",
+            "-ss", f"{start:.3f}",
+            "-i", local_path,
+            "-t", str(clip_duration),
+            "-an",
+            "-c", "copy",
+            clip_path,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if (
+                result.returncode == 0
+                and os.path.exists(clip_path)
+                and os.path.getsize(clip_path) > 0
+            ):
+                clip_paths.append(clip_path)
+        except Exception as e:
+            logger.debug(f"motion clip cut failed at {start:.1f}s for '{video_id}': {e}")
+
+    if clip_paths:
+        logger.info(
+            f"youtube: cut {len(clip_paths)} motion clip(s) from the downloaded "
+            f"segment of '{video_id}'"
+        )
+    return clip_paths
+
+
 def extract_screenshot_frames(
     video_id: str,
     video_url: str,
@@ -645,23 +799,12 @@ def extract_screenshot_frames(
     天空背景）的问题。抽帧走本地文件而不是对远端直链反复 seek，更稳定也
     更快。
     """
-    if duration <= 0:
+    fetched = fetch_topic_segment(
+        video_id, video_url, duration, output_dir, segment_seconds
+    )
+    if not fetched:
         return []
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    margin = duration * 0.1
-    seg_start = margin
-    seg_end = min(duration - margin, seg_start + segment_seconds)
-    if seg_end - seg_start < 5:
-        seg_start, seg_end = 0, min(duration, segment_seconds)
-
-    local_path = os.path.join(output_dir, f"ssbase-{video_id}.mp4")
-    if not (os.path.exists(local_path) and os.path.getsize(local_path) > 0):
-        if not _download_youtube_segment(video_url, seg_start, seg_end, local_path):
-            return []
-
-    seg_duration = seg_end - seg_start
+    local_path, seg_duration = fetched
     ffmpeg_binary = utils.get_ffmpeg_binary()
     frame_paths = []
     for i in range(1, max_frames + 1):
