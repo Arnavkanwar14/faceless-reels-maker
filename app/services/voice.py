@@ -482,7 +482,16 @@ def tts(
             return None
     elif is_kokoro_voice(voice_name):
         return kokoro_tts(text, voice_name, voice_rate, voice_file, voice_volume)
-    return azure_tts_v1(text, voice_name, voice_rate, voice_file)
+
+    result = azure_tts_v1(text, voice_name, voice_rate, voice_file)
+    if result is not None:
+        return result
+
+    # edge-tts 走的是微软的公开接口，网络稍有波动就会整段超时（实测过连续
+    # 两次 30s 超时、第三次才成功）。三次重试都失败时，与其让整条生成流程
+    # 卡在没有旁白上，不如换一家再试一次。
+    logger.warning("edge-tts failed after retries, falling back to gemini tts")
+    return gemini_tts(text, voice_file)
 
 
 def convert_rate_to_percent(rate: float) -> str:
@@ -1496,6 +1505,85 @@ def kokoro_tts(
         return sub_maker
     except Exception as e:
         logger.error(f"kokoro tts failed: {str(e)}")
+        return None
+
+
+_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+_GEMINI_TTS_VOICE = "Kore"
+_GEMINI_TTS_SAMPLE_RATE = 24000
+
+
+def gemini_tts(text: str, voice_file: str) -> Union[SubMaker, None]:
+    """最后一层兜底：本地 Kokoro 和 edge-tts 都不可用时，用 Gemini 生成旁白。
+
+    复用视觉检查那把 key（同一个 Google API key）。返回的是裸 PCM
+    （signed 16-bit little-endian, 24kHz 单声道），没有 WAV 头，需要自己
+    包一层再交给 pydub 转码。
+
+    注意：这条路径拿不到逐词时间戳，所以只返回一个空的 SubMaker——上层
+    的字幕生成会退回到 whisper 转写那条路，而不是依赖 TTS 自带的时间轴。
+    """
+    api_key = config.app.get("gemini_vision_api_key", "")
+    if not api_key:
+        logger.error("gemini tts: no api key configured")
+        return None
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{_GEMINI_TTS_MODEL}:generateContent?key={api_key}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {
+                "voiceConfig": {
+                    "prebuiltVoiceConfig": {"voiceName": _GEMINI_TTS_VOICE}
+                }
+            },
+        },
+    }
+
+    try:
+        import base64
+        import io
+        import wave
+
+        response = requests.post(url, json=payload, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+        encoded = (
+            data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+        )
+        pcm = base64.b64decode(encoded)
+        if not pcm:
+            logger.error("gemini tts returned no audio")
+            return None
+
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(_GEMINI_TTS_SAMPLE_RATE)
+            wav_file.writeframes(pcm)
+        wav_buffer.seek(0)
+
+        output_format = utils.parse_extension(voice_file) or "mp3"
+        if output_format == "wav":
+            with open(voice_file, "wb") as f:
+                f.write(wav_buffer.getvalue())
+        else:
+            from pydub import AudioSegment
+
+            _configure_pydub_ffmpeg(AudioSegment)
+            AudioSegment.from_file(wav_buffer, format="wav").export(
+                voice_file, format=output_format
+            )
+
+        logger.success(f"gemini tts succeeded: {voice_file}")
+        return SubMaker()
+    except Exception as e:
+        logger.error(f"gemini tts failed: {str(e)}")
         return None
 
 

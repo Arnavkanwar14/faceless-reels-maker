@@ -840,9 +840,138 @@ def generate_script(
             logger.warning(f"failed to generate video script, trying again... {i + 1}")
     if "Error: " in final_script:
         logger.error(f"failed to generate video script: {final_script}")
-    else:
-        logger.success(f"completed: \n{final_script}")
+        return final_script.strip()
+
+    final_script = _tighten_script(final_script, video_subject, grounding_context)
+    _flag_ungrounded_entities(final_script, grounding_context, video_subject)
+    logger.success(f"completed: \n{final_script}")
     return final_script.strip()
+
+
+# 句首大写、以及这些常见词的大写形式，不是专有名词，不该被当成"待核实实体"。
+_COMMON_CAPITALIZED_WORDS = frozenset(
+    {
+        "the", "this", "that", "these", "those", "it", "its", "they", "their",
+        "and", "but", "for", "with", "from", "you", "your", "we", "our", "he",
+        "she", "his", "her", "in", "on", "at", "to", "of", "a", "an", "is",
+        "are", "was", "were", "be", "been", "will", "would", "can", "could",
+        "when", "what", "why", "how", "who", "where", "if", "then", "now",
+        "here", "there", "every", "each", "all", "some", "no", "not", "so",
+        "meet", "watch", "look", "see", "imagine", "think", "remember", "but",
+    }
+)
+_ENTITY_RE = re.compile(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b")
+
+
+def _flag_ungrounded_entities(
+    script: str, grounding_context: str, video_subject: str
+) -> None:
+    """把脚本里出现、但搜索到的真实资料里找不到的专有名词标出来。
+
+    脚本生成最容易出问题的就是这类具体名词：模型不知道某个新预告片里到底
+    有谁，就用训练数据里"最像的"名字去填，语气还特别笃定（之前那次就凭空
+    写出了黑寡妇、绿巨人和钢铁侠）。提示词里的"不要编造"和后面的精简重写
+    都只是软约束，模型完全可能照样写。
+
+    这里只做提示不自动改写：核实逻辑本身是启发式的（资料抓取可能不全，
+    正常的同义表述也可能对不上），据此自动重写反而可能把正确内容删掉。
+    把可疑项打到日志里，人一眼就能判断，比悄悄放过去强。
+    """
+    if not script or not grounding_context:
+        return
+
+    grounding_lower = grounding_context.lower()
+    subject_lower = video_subject.lower()
+
+    suspicious = []
+    for match in _ENTITY_RE.findall(script):
+        words = match.strip().split()
+        # 句首的 "But"/"And"/"This" 之类会被正则连进后面的名字里（"But Black
+        # Widow"），先把开头的常见词剥掉，留下真正的专有名词。
+        while words and words[0].lower() in _COMMON_CAPITALIZED_WORDS:
+            words = words[1:]
+        if not words:
+            continue
+        entity = " ".join(words)
+        entity_lower = entity.lower()
+        if entity_lower in subject_lower or entity_lower in grounding_lower:
+            continue
+        # 多词名字只看最有区分度的那个词（通常是最后一个）。
+        #
+        # 不能"任意一个词对上就放行"：那样 "Black Widow" 会因为资料里有
+        # "Black Panther" 而被放过——而这恰恰是最典型的编造方式，用真实
+        # 存在的相邻名字凑出一个没被提到的角色。反过来，"Doctor Doom" 只要
+        # 资料里出现 "Doom" 就该放行，所以也不能要求整串完全匹配。
+        distinctive = words[-1].lower()
+        if len(distinctive) > 3 and distinctive in grounding_lower:
+            continue
+        suspicious.append(entity)
+
+    unique = sorted(set(suspicious))
+    if unique:
+        logger.warning(
+            "script mentions names/terms that do not appear in the researched "
+            f"sources - verify before publishing: {', '.join(unique[:10])}"
+        )
+
+
+def _tighten_script(script: str, video_subject: str, grounding_context: str = "") -> str:
+    """让模型再过一遍自己写的稿子：删废话、收紧开头、剔除没有依据的说法。
+
+    第一次生成时模型要同时顾及结构、信息量、语气和事实约束，顾此失彼很正常
+    ——留下的往往是"其实呢""不仅如此"这类不承载信息的连接词，以及开头几句
+    的铺垫。让它专门再看一遍、只做删减，比在原提示词里继续堆要求有效得多。
+
+    任何异常或可疑结果都原样返回初稿：这是锦上添花的一步，不该成为脚本
+    生成失败的原因。
+    """
+    if not script or len(script.split()) < 25:
+        return script
+
+    grounding_rule = (
+        "- delete any claim not supported by these facts:\n"
+        f"{grounding_context[:1500]}\n"
+        if grounding_context
+        else "- delete any specific claim (names, numbers, dates) you are not certain of\n"
+    )
+
+    prompt = f"""Tighten this short-video narration about "{video_subject}".
+
+Make these edits only:
+- cut filler phrases and words that carry no information
+- make the first sentence land harder; it decides whether people keep watching
+- remove any sentence that repeats a point already made
+{grounding_rule}
+Keep the same voice, language and overall length target. Do not add new
+claims, do not add commentary. Return ONLY the edited narration text.
+
+Narration:
+{script}
+"""
+
+    try:
+        tightened = _generate_response(prompt=prompt)
+    except Exception as e:
+        logger.debug(f"script tightening pass failed, keeping the draft: {e}")
+        return script
+
+    tightened = (tightened or "").strip()
+    if not tightened:
+        return script
+
+    # 防止这一步跑偏：正常的删减不会把稿子砍掉一半以上，也不该反而变长。
+    # 出现这种情况通常意味着模型没在"编辑"而是在重写或者答非所问。
+    original_words = len(script.split())
+    new_words = len(tightened.split())
+    if new_words < original_words * 0.5 or new_words > original_words * 1.1:
+        logger.debug(
+            f"script tightening changed length too much "
+            f"({original_words} -> {new_words} words), keeping the draft"
+        )
+        return script
+
+    logger.info(f"script tightened: {original_words} -> {new_words} words")
+    return tightened
 
 
 def _strip_code_fence(text: str) -> str:

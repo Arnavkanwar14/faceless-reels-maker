@@ -504,6 +504,38 @@ def _get_sentence_durations(subtitle_path: str) -> list[float]:
     return durations
 
 
+_MIN_UNIQUE_MATERIAL_COVERAGE = 0.6
+
+
+def _warn_if_materials_too_thin(
+    downloaded_videos: list, audio_duration: float, params
+) -> None:
+    """素材不够铺满旁白时给出明确警告。
+
+    素材不足时，合成阶段会把已有片段循环播放来凑时长——观众看到的就是同样
+    几个画面反复出现，这也是"整条 reel 一直在重复"的由来。循环本身是必要的
+    兜底（总比黑屏好），但它会把"素材没找够"这件事悄悄掩盖过去，日志里只剩
+    一行 looping clips。这里显式把覆盖率算出来讲清楚，免得每次都要靠看成片
+    才发现素材不够。
+    """
+    if not downloaded_videos or audio_duration <= 0:
+        return
+
+    clip_duration = params.video_clip_duration or 5
+    unique_coverage = len(set(downloaded_videos)) * clip_duration
+    ratio = unique_coverage / audio_duration
+    if ratio >= _MIN_UNIQUE_MATERIAL_COVERAGE:
+        return
+
+    logger.warning(
+        f"only {len(set(downloaded_videos))} unique clip(s) covering "
+        f"{unique_coverage:.0f}s of {audio_duration:.0f}s narration "
+        f"({ratio:.0%}) - the same shots will repeat several times. "
+        "Consider a broader subject, more search terms, or allowing more "
+        "sources."
+    )
+
+
 def generate_final_videos(
     task_id, params, downloaded_videos, audio_file, subtitle_path
 ):
@@ -699,6 +731,8 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     downloaded_videos = quality_gate.filter_low_quality_clips(downloaded_videos)
     # 开场镜头决定观众要不要划走，把视觉上最抓眼的一段素材挪到最前面。
     downloaded_videos = quality_gate.rank_by_visual_interest(downloaded_videos)
+
+    _warn_if_materials_too_thin(downloaded_videos, audio_duration, params)
 
     if stop_at == "materials":
         sm.state.update_task(
