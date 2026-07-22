@@ -328,12 +328,29 @@ def _collect_motion_clips(
     分辨率不达标时整批放弃——低清动态片段和低清截图一样不能用，而且这种
     情况下回退到网页图片搜索通常还能捞到能用的图。
     """
+    # 先用"找原始素材"的问法去搜，再退回原始关键词。
+    #
+    # 关键词是按脚本内容生成的（"所有英雄确认出演"这种），而官方发布的视频
+    # 标题里根本不会这么写——标题相关性一过滤，剩下的全是解说号和搬运号，
+    # 拿到的画面自然又糊又带台标。实测同一个主题：用 "…all heroes confirmed"
+    # 搜到的是粉丝剪辑（360p，被判定不可用），换成 "…trailer" 直接搜到
+    # Marvel Entertainment 官方频道的 1080p 预告片。
+    footage_terms = [
+        f"{video_subject} official trailer",
+        f"{video_subject} trailer",
+    ] + list(search_terms)
+
     clips: List[str] = []
-    for term in search_terms:
+    tried_videos = set()
+    for term in footage_terms:
         if len(clips) >= needed:
             break
 
         video = material.find_best_youtube_video(term, video_subject, minimum_duration=10)
+        if video and video["video_id"] in tried_videos:
+            continue
+        if video:
+            tried_videos.add(video["video_id"])
         if not video:
             continue
 
@@ -364,6 +381,16 @@ def _collect_motion_clips(
         )
 
     if clips:
+        # 均匀切出来的片段不代表画面就有变化：碰上一个长镜头（比如缓慢横摇
+        # 过一排导演椅），四段切出来几乎是同一个画面，成片就成了二十秒的
+        # 同一个镜头。这里按抽帧感知哈希去重，只留下真正不同的镜头。
+        before = len(clips)
+        clips = quality_gate.dedupe_clips(clips)
+        if len(clips) < before:
+            logger.info(
+                f"real_images: {before - len(clips)} motion clip(s) were the same "
+                "shot as another - dropped so the video does not repeat itself"
+            )
         # 动态片段同样要过一遍水印/相关性判定：搬运号的画面一样会压台标。
         clips = visual_gate.filter_relevant_clips(clips, video_subject)
     return clips

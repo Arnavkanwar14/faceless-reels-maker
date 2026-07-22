@@ -274,6 +274,40 @@ def filter_low_quality_images(image_paths: List[str]) -> List[str]:
     return accepted
 
 
+def dedupe_clips(video_paths: List[str]) -> List[str]:
+    """只做去重：剔除画面和前面某一段几乎一样的片段，不做明暗/模糊判断。
+
+    filter_low_quality_clips 不适合这个场景：从预告片里切出来的镜头本来就
+    可能整体很暗（夜戏、暗色调），会被近黑判定整批拒掉，然后触发"全被拒就
+    全部放行"的兜底，结果一条都没去掉。这里只比较感知哈希，暗不暗不影响
+    判断。
+
+    抽帧失败的片段一律保留，不因为检测本身的问题丢素材。
+    """
+    kept: List[str] = []
+    kept_hashes: List[str] = []
+
+    for path in video_paths:
+        image = _extract_frame_image(path)
+        if image is None:
+            kept.append(path)
+            continue
+        try:
+            frame_hash = _average_hash(image)
+        except Exception:
+            kept.append(path)
+            continue
+        if any(
+            _hamming_distance(frame_hash, existing) <= _DUPLICATE_HAMMING_THRESHOLD
+            for existing in kept_hashes
+        ):
+            continue
+        kept_hashes.append(frame_hash)
+        kept.append(path)
+
+    return kept
+
+
 def rank_by_visual_interest(video_paths: List[str]) -> List[str]:
     """把边缘方差（细节/对比度的粗略代理指标）最高的一段素材挪到最前面。
 
