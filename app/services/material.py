@@ -726,6 +726,45 @@ def fetch_topic_segment(
     return local_path, seg_end - seg_start
 
 
+# 场景切换判定阈值：相邻帧差异超过这个比例才算换了一个镜头。
+# 0.3 是 ffmpeg scene 检测的常用取值，能认出真正的剪辑点，又不会把镜头内
+# 的运动/光线变化误判成切换。
+_SCENE_CHANGE_THRESHOLD = 0.3
+
+
+def _detect_scene_changes(local_path: str, max_probe_seconds: int = 40) -> List[float]:
+    """找出片段里真正发生镜头切换的时间点。
+
+    均匀切分有个隐含假设：这段素材里画面一直在变。碰上一个长镜头（比如缓慢
+    横摇过一排导演椅）这个假设就不成立了——四段切出来是同一个镜头的四个
+    相邻瞬间，成片看着就是二十秒没换过画面。按真实剪辑点去切，每段才对应
+    一个不同的镜头。
+
+    检测失败或没找到切换点时返回空列表，调用方回退到均匀切分。
+    """
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    cmd = [
+        ffmpeg_binary,
+        "-i", local_path,
+        "-t", str(max_probe_seconds),
+        "-filter:v", f"select='gt(scene,{_SCENE_CHANGE_THRESHOLD})',showinfo",
+        "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except Exception as e:
+        logger.debug(f"scene detection failed for '{local_path}': {e}")
+        return []
+
+    timestamps = []
+    for match in re.finditer(r"pts_time:([0-9.]+)", result.stderr or ""):
+        try:
+            timestamps.append(float(match.group(1)))
+        except ValueError:
+            continue
+    return sorted(set(timestamps))
+
+
 def extract_motion_clips(
     local_path: str,
     segment_duration: float,
@@ -734,7 +773,7 @@ def extract_motion_clips(
     count: int = 4,
     clip_duration: int = 5,
 ) -> List[str]:
-    """从已经下载到本地的片段里，均匀切出若干条短的动态片段。
+    """从已经下载到本地的片段里切出若干条短的动态片段，尽量一段一个镜头。
 
     真实的动态画面永远比"静态图 + Ken Burns 推镜"更有说服力——推镜只是在
     模拟运动，而这里就是原始素材本身。片段本来就已经为抽帧下载好了，切成
@@ -747,10 +786,33 @@ def extract_motion_clips(
 
     ffmpeg_binary = utils.get_ffmpeg_binary()
     usable = max(0.0, segment_duration - clip_duration)
-    clip_paths = []
 
-    for i in range(count):
-        start = (usable * i / count) if count > 1 else 0.0
+    # 按真实剪辑点切，每段落在一个不同的镜头上。第一个切换点之前本身也是
+    # 一个镜头，所以候选起点是 [0] + 各个切换点。
+    scene_starts = [t for t in _detect_scene_changes(local_path) if t <= usable]
+    shot_starts = [0.0] + scene_starts
+
+    # 关键点：这段素材里有几个镜头，就最多切几段。
+    #
+    # 硬凑满 count 段的话，长镜头素材会被切成同一个画面的四个相邻瞬间——
+    # 检测到 0 个切换点却还要切 4 段，等于明知是一个镜头还假装有四个。宁可
+    # 这条视频只贡献 1 段，剩下的名额交给下一条视频去填（_collect_motion_clips
+    # 本来就会继续往下找），素材之间的差异才是真的。
+    effective_count = min(count, len(shot_starts))
+    if effective_count < count:
+        logger.info(
+            f"youtube: '{video_id}' contains only {len(shot_starts)} distinct "
+            f"shot(s) in the fetched segment - taking {effective_count} clip(s) "
+            "from it instead of repeating the same shot, will look elsewhere "
+            "for the rest"
+        )
+
+    # 切换点多于需要的段数时隔着取，让选出来的镜头之间跨度更大。
+    step = len(shot_starts) / effective_count
+    starts = [shot_starts[int(i * step)] for i in range(effective_count)]
+
+    clip_paths = []
+    for i, start in enumerate(starts):
         clip_path = os.path.join(output_dir, f"ssclip-{video_id}-{i}.mp4")
         if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
             clip_paths.append(clip_path)
