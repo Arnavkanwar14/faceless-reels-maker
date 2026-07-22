@@ -24,10 +24,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PIL import Image, ImageDraw  # noqa: E402
-
 from app.models.schema import VideoAspect  # noqa: E402
-from app.services import real_images  # noqa: E402
+from app.services import quality_gate, real_images, review_sheet  # noqa: E402
 from app.utils import utils  # noqa: E402
 
 DEFAULT_TOPICS = [
@@ -35,43 +33,6 @@ DEFAULT_TOPICS = [
     "Avengers Doomsday all heroes confirmed",
     "James Webb telescope new discoveries",
 ]
-
-THUMB_W, THUMB_H = 270, 480
-PADDING = 8
-
-
-def _first_frame(clip_path: str, out_path: str) -> bool:
-    cmd = [
-        utils.get_ffmpeg_binary(), "-y",
-        "-ss", "1", "-i", clip_path,
-        "-frames:v", "1", out_path,
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, timeout=30)
-        return os.path.exists(out_path)
-    except Exception:
-        return False
-
-
-def _contact_sheet(frames: list[str], title: str, out_path: str) -> None:
-    if not frames:
-        return
-    cols = len(frames)
-    sheet = Image.new(
-        "RGB",
-        (cols * THUMB_W + (cols + 1) * PADDING, THUMB_H + 2 * PADDING + 24),
-        (18, 18, 18),
-    )
-    for i, frame in enumerate(frames):
-        try:
-            with Image.open(frame) as img:
-                img = img.convert("RGB").resize((THUMB_W, THUMB_H), Image.LANCZOS)
-                sheet.paste(img, (PADDING + i * (THUMB_W + PADDING), PADDING + 24))
-        except Exception:
-            continue
-    ImageDraw.Draw(sheet).text((PADDING, 6), title, fill=(230, 230, 230))
-    sheet.save(out_path)
-
 
 def main(topics: list[str]) -> int:
     out_dir = utils.storage_dir("sourcing_review", create=True)
@@ -88,16 +49,13 @@ def main(topics: list[str]) -> int:
             max_clip_duration=5,
             material_directory=work_dir,
         )
-        print(f"selected {len(clips)} clips")
+        distinct = quality_gate.count_distinct_shots(clips) if clips else 0
+        print(f"selected {len(clips)} clips ({distinct} visually distinct)")
 
-        frames = []
-        for i, clip in enumerate(clips):
-            frame = os.path.join(work_dir, f"review-{utils.md5(topic)}-{i}.jpg")
-            if _first_frame(clip, frame):
-                frames.append(frame)
-
-        sheet_path = os.path.join(out_dir, f"{utils.md5(topic)}.png")
-        _contact_sheet(frames, topic, sheet_path)
+        sheet_path = review_sheet.build_contact_sheet(
+            clips, f"{topic}  -  {distinct} distinct shot(s)",
+            os.path.join(out_dir, f"{utils.md5(topic)}.png"),
+        )
         print(f"contact sheet: {sheet_path}")
 
     print(f"\nreview the sheets in: {out_dir}")

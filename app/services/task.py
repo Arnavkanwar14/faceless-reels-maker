@@ -14,6 +14,7 @@ from app.services import (
     material,
     quality_gate,
     real_images,
+    review_sheet,
     subtitle,
     twelvelabs,
     video,
@@ -522,13 +523,16 @@ def _warn_if_materials_too_thin(
         return
 
     clip_duration = params.video_clip_duration or 5
-    unique_coverage = len(set(downloaded_videos)) * clip_duration
+    # 按"看得出区别的画面数"算，而不是按文件数。同一个长镜头切出来的几段、
+    # 或者同一张图的不同副本，文件数是够的，观众看到的还是同一个画面。
+    distinct = quality_gate.count_distinct_shots(list(set(downloaded_videos)))
+    unique_coverage = distinct * clip_duration
     ratio = unique_coverage / audio_duration
     if ratio >= _MIN_UNIQUE_MATERIAL_COVERAGE:
         return
 
     logger.warning(
-        f"only {len(set(downloaded_videos))} unique clip(s) covering "
+        f"only {distinct} visually distinct shot(s) covering "
         f"{unique_coverage:.0f}s of {audio_duration:.0f}s narration "
         f"({ratio:.0%}) - the same shots will repeat several times. "
         "Consider a broader subject, more search terms, or allowing more "
@@ -733,6 +737,11 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     downloaded_videos = quality_gate.rank_by_visual_interest(downloaded_videos)
 
     _warn_if_materials_too_thin(downloaded_videos, audio_duration, params)
+    # 把最终选中的素材拼成一张总览图放在成片目录里。日志答不了"这些画面对不
+    # 对"这个问题，扫一眼图就能答——而且不用记得去跑什么命令。
+    review_sheet.write_for_task(
+        downloaded_videos, params.video_subject, utils.task_dir(task_id)
+    )
 
     if stop_at == "materials":
         sm.state.update_task(

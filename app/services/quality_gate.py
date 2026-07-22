@@ -308,6 +308,37 @@ def dedupe_clips(video_paths: List[str]) -> List[str]:
     return kept
 
 
+def count_distinct_shots(video_paths: List[str]) -> int:
+    """这批素材里实际有几个互不相同的画面。
+
+    "有几段素材"和"观众能看出几个不同画面"是两回事：同一个长镜头切出来的
+    四段、或者同一张海报的四个转载版本，数量上是 4，观感上是 1。判断素材
+    够不够时，该看的是后者。
+
+    抽帧失败的按各自独立计数，避免因为检测问题低估可用素材。
+    """
+    hashes: List[str] = []
+    unreadable = 0
+
+    for path in video_paths:
+        image = _extract_frame_image(path)
+        if image is None:
+            unreadable += 1
+            continue
+        try:
+            frame_hash = _average_hash(image)
+        except Exception:
+            unreadable += 1
+            continue
+        if not any(
+            _hamming_distance(frame_hash, existing) <= _DUPLICATE_HAMMING_THRESHOLD
+            for existing in hashes
+        ):
+            hashes.append(frame_hash)
+
+    return len(hashes) + unreadable
+
+
 def rank_by_visual_interest(video_paths: List[str]) -> List[str]:
     """把边缘方差（细节/对比度的粗略代理指标）最高的一段素材挪到最前面。
 

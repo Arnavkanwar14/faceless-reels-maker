@@ -369,30 +369,42 @@ def _collect_motion_clips(
             )
             continue
 
-        clips.extend(
-            material.extract_motion_clips(
-                local_path,
-                seg_duration,
-                output_dir,
-                video["video_id"],
-                count=needed - len(clips),
-                clip_duration=clip_duration,
-            )
+        fresh = material.extract_motion_clips(
+            local_path,
+            seg_duration,
+            output_dir,
+            video["video_id"],
+            count=needed - len(clips),
+            clip_duration=clip_duration,
         )
+        if not fresh:
+            continue
+
+        # 每拿到一批就立刻和已接受的素材一起去重，而不是等全部收完再统一
+        # 处理。差别在于名额怎么算：收完再去重的话，两段其实一样的素材在
+        # 循环里各占一个名额，凑够数就不再往下找了，去重之后才发现只剩一段
+        # ——这时候已经没有机会再去别的视频里补了。边收边去重，重复的当场
+        # 不占名额，循环会自动继续找下一条视频，直到真的凑够不同的画面。
+        before = len(clips)
+        clips = quality_gate.dedupe_clips(clips + fresh)
+        rejected = len(fresh) - (len(clips) - before)
+        if rejected > 0:
+            logger.info(
+                f"real_images: {rejected} clip(s) from '{video['title'][:40]}' "
+                "duplicate a shot we already have - looking at another video "
+                "instead of repeating it"
+            )
 
     if clips:
-        # 均匀切出来的片段不代表画面就有变化：碰上一个长镜头（比如缓慢横摇
-        # 过一排导演椅），四段切出来几乎是同一个画面，成片就成了二十秒的
-        # 同一个镜头。这里按抽帧感知哈希去重，只留下真正不同的镜头。
-        before = len(clips)
-        clips = quality_gate.dedupe_clips(clips)
-        if len(clips) < before:
-            logger.info(
-                f"real_images: {before - len(clips)} motion clip(s) were the same "
-                "shot as another - dropped so the video does not repeat itself"
-            )
         # 动态片段同样要过一遍水印/相关性判定：搬运号的画面一样会压台标。
         clips = visual_gate.filter_relevant_clips(clips, video_subject)
+
+    distinct = quality_gate.count_distinct_shots(clips) if clips else 0
+    if clips and distinct < len(clips):
+        logger.info(
+            f"real_images: {len(clips)} motion clip(s) but only {distinct} "
+            "visually distinct shot(s)"
+        )
     return clips
 
 
