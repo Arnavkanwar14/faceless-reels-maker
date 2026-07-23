@@ -723,10 +723,14 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
         return
 
-    if effective_video_source != "local":
-        # 本地素材是用户手动挑选的，没有"搜索词/主题相关性"这个概念，
-        # 跳过视觉相关性检查；其它来源都可能因为文本匹配不准确而混入
-        # 画面上完全不相关的素材，用免费视觉模型再做一层把关。
+    if effective_video_source not in ("local", "real_images"):
+        # 本地素材是用户手动挑选的，没有"搜索词/主题相关性"这个概念；
+        # real_images 在 download_real_image_clips 内部已经对整个候选池做过
+        # 一次视觉把关（还带缓存），这里再查一遍纯属重复，而且是在渲染成
+        # 片段之后才拒，会把已经算进覆盖率的素材又拿掉，导致成片素材忽然
+        # 变少、拼接阶段只能循环那几段。所以这两种来源都跳过。
+        # 其余来源（pexels/pixabay/youtube 库存）没有前置视觉检查，仍然需要
+        # 在这里用免费视觉模型把画面完全不相关的素材拦掉。
         downloaded_videos = visual_gate.filter_relevant_clips(
             downloaded_videos, params.video_subject
         )
