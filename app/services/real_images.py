@@ -27,6 +27,7 @@ keywords but doesn't actually show the subject.
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 from typing import List
@@ -62,6 +63,9 @@ _POOL_OVERSAMPLE = 4
 # 到此为止；真的只有一两张时，剩下的时间仍需少量循环，但每次停留够长，
 # 观感远好于短片段快速循环。
 _MAX_STRETCHED_CLIP_DURATION = 15
+# 覆盖率底线：最终不同镜头（按基础片段时长算）至少要覆盖这么多比例的旁白，
+# 否则从 COLLAGE、再到 GENERIC 逐级往回捞，直到够线或候选用尽。
+_COVERAGE_FLOOR = 0.7
 # 感知哈希汉明距离阈值，超过这个距离才算不同的画面。海报类素材被各站转载后
 # 往往只有轻微的压缩/裁切差异，阈值太小会漏判成"不同的图"。
 _DUPLICATE_HAMMING_THRESHOLD = 6
@@ -605,24 +609,59 @@ def download_real_image_clips(
     verdicts = visual_gate.classify_images_batch(ranked_paths, video_subject)
     source_by_path = {path: source for _, path, source in scored}
 
-    usable = [p for p in ranked_paths if verdicts.get(p) == visual_gate.VERDICT_OK]
-    if not usable:
-        # 一张都没过时，放行"没被判定为水印/拼图"的，但带水印的绝不放回来。
-        usable = [
-            p
-            for p in ranked_paths
-            if verdicts.get(p)
-            not in (visual_gate.VERDICT_WATERMARK, visual_gate.VERDICT_GENERIC)
-        ]
-        if usable:
-            logger.warning(
-                "real_images: no candidate passed the full visual check, "
-                "falling back to the sharpest non-watermarked ones"
+    # ---- 覆盖率兜底：分级放行，先干净后切题，绝不越过水印线 ----
+    #
+    # ranked_paths 已经按清晰度从高到低排过序，所以各档按此顺序取就是"每档
+    # 里最清晰的优先"。
+    #
+    # 目标：至少凑够能覆盖 70% 旁白的不同镜头数（按基础片段时长算）。达不到
+    # 就分级往回捞：
+    #   1) OK      —— 干净、切题、能认出主体。能填多少填多少，直到 needed。
+    #   2) COLLAGE —— 多格漫画页：切题、是真内容，只是构图杂。用来把镜头数
+    #                 补到 70% 底线（漫画类主题网上大多是这种，总比循环强）。
+    #   3) GENERIC —— 切题但画面空洞的兜底。只有前两档还凑不够底线时才用。
+    # POSTER（海报/宣传图）、UNRELATED（跑题）、WATERMARK（带标）、UNKNOWN
+    # （没核实成）一律不进——保持"稍微严格"，也守住绝不用带水印素材这条线。
+    def _tier(*wanted):
+        return [p for p in ranked_paths if verdicts.get(p) in wanted]
+
+    target_distinct = max(1, math.ceil(_COVERAGE_FLOOR * needed))
+
+    usable = _tier(visual_gate.VERDICT_OK)[:needed]
+
+    if len(usable) < target_distinct:
+        for p in _tier(visual_gate.VERDICT_COLLAGE):
+            if len(usable) >= target_distinct:
+                break
+            if p not in usable:
+                usable.append(p)
+        collage_added = len(usable) - len(_tier(visual_gate.VERDICT_OK)[:needed])
+        if collage_added > 0:
+            logger.info(
+                f"real_images: only "
+                f"{len(_tier(visual_gate.VERDICT_OK))} clean clip(s) - added "
+                f"{collage_added} on-topic collage/comic-page shot(s) to reach "
+                f"the {int(_COVERAGE_FLOOR * 100)}% coverage floor"
             )
 
+    if len(usable) < target_distinct:
+        before = len(usable)
+        for p in _tier(visual_gate.VERDICT_GENERIC):
+            if len(usable) >= target_distinct:
+                break
+            if p not in usable:
+                usable.append(p)
+        if len(usable) > before:
+            logger.info(
+                f"real_images: still short - added {len(usable) - before} "
+                "generic on-topic shot(s) as last resort for coverage"
+            )
+
+    coverage = (len(usable) * max_clip_duration / audio_duration) if audio_duration else 1.0
     logger.info(
-        f"real_images: pooled {len(pool)} candidates, {len(usable)} usable after "
-        f"scoring + visual check (need {needed})"
+        f"real_images: pooled {len(pool)} candidates, {len(usable)} usable "
+        f"(~{coverage:.0%} coverage, floor {int(_COVERAGE_FLOOR * 100)}%, "
+        f"need {needed})"
     )
 
     # ---- 4. 择优渲染 ----
