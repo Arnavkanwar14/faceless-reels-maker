@@ -51,6 +51,13 @@ VERDICT_UNRELATED = "unrelated"
 # 街道、一个认不出是什么的特写）。这类图不算"错"，但放进成片就是废镜头，
 # 观众看不出它和主题有什么关系，所以同样要拒掉。
 VERDICT_GENERIC = "generic"
+# 多格漫画页/网格拼图：画面其实高度切题（就是这个角色/主体本身），只是构图
+# 上是好几格拼在一起，当单个镜头用观感偏杂。和 GENERIC 分开是为了让覆盖率
+# 兜底能优先捞这类"真内容但构图杂"的图，而不是捞纯废镜头。
+VERDICT_COLLAGE = "collage"
+# 海报/宣传图/立绘：切题但是营销物料，不是实拍/截图画面。默认不用，兜底也
+# 不用——它和真实画面观感差别明显。
+VERDICT_POSTER = "poster"
 VERDICT_WATERMARK = "watermark"
 # 检查没能真正跑起来（没配 key、超额、网络错误）。必须和 OK 区分开：把
 # "没检查"当成"检查通过"，正是带水印素材混进成片的原因。
@@ -140,18 +147,24 @@ def _cache_key(image_path: str, video_subject: str) -> str | None:
     return digest.hexdigest()
 
 
+# 可以缓存的判定：确定性的真实结论。UNKNOWN（当时没检查成）不缓存——否则
+# 一次限流就把这张图永久钉死成"没核实"。
+_CACHEABLE_VERDICTS = (
+    VERDICT_OK, VERDICT_WATERMARK, VERDICT_GENERIC, VERDICT_COLLAGE,
+    VERDICT_POSTER, VERDICT_UNRELATED,
+)
+
+
 def _cache_get(image_path: str, video_subject: str) -> str | None:
     key = _cache_key(image_path, video_subject)
     if key is None:
         return None
     verdict = _load_cache().get(key)
-    # UNKNOWN 表示"当时没检查成"，不该被缓存成永久结论——否则一次限流就把
-    # 这张图永久钉死成"没核实"。只缓存真正的判定结果。
-    return verdict if verdict in (VERDICT_OK, VERDICT_WATERMARK, VERDICT_GENERIC, VERDICT_UNRELATED) else None
+    return verdict if verdict in _CACHEABLE_VERDICTS else None
 
 
 def _cache_put(image_path: str, video_subject: str, verdict: str) -> None:
-    if verdict not in (VERDICT_OK, VERDICT_WATERMARK, VERDICT_GENERIC, VERDICT_UNRELATED):
+    if verdict not in _CACHEABLE_VERDICTS:
         return
     key = _cache_key(image_path, video_subject)
     if key is None:
@@ -280,16 +293,19 @@ def _classify_data_uri(data_uri: str, video_subject: str, label: str) -> str:
             )
             return VERDICT_UNRELATED
         if "COLLAGE" in answer:
-            # 和 GENERIC 归为同一类处理（都是"不能当成一个独立镜头用"），
-            # 但日志里保留真实原因，方便排查素材质量问题。
             logger.info(
-                f"visual_gate: rejected as a collage/grid of multiple images "
+                f"visual_gate: flagged as a collage/grid of multiple images "
                 f"({name}): {label}"
             )
-            return VERDICT_GENERIC
+            return VERDICT_COLLAGE
+        if "POSTER" in answer:
+            logger.info(
+                f"visual_gate: flagged as poster/promotional art ({name}): {label}"
+            )
+            return VERDICT_POSTER
         if "GENERIC" in answer:
             logger.info(
-                f"visual_gate: rejected as generic filler - nothing identifies "
+                f"visual_gate: flagged as generic filler - nothing identifies "
                 f"'{video_subject}' ({name}): {label}"
             )
             return VERDICT_GENERIC
@@ -340,10 +356,10 @@ def _parse_batch_answer(answer: str, count: int) -> List[str] | None:
     """从模型回答里解出每张图的判定。解析不出来返回 None，由调用方回退。"""
     verdict_by_token = {
         "WATERMARK": VERDICT_WATERMARK,
-        # 拼图和海报都归到"不能当独立镜头用"这一类：它们本身不违规，但都不是
-        # 我们要的真实画面。放在 GENERIC 桶里，兜底逻辑就不会把它们捞回来。
-        "COLLAGE": VERDICT_GENERIC,
-        "POSTER": VERDICT_GENERIC,
+        # 拼图、海报、纯泛用图各归各的桶——覆盖率兜底要靠这个区分来决定优先
+        # 捞哪一类（拼图=真内容，优先；海报/泛用=最后才考虑或干脆不用）。
+        "COLLAGE": VERDICT_COLLAGE,
+        "POSTER": VERDICT_POSTER,
         "GENERIC": VERDICT_GENERIC,
         "UNRELATED": VERDICT_UNRELATED,
         "OK": VERDICT_OK,
@@ -432,20 +448,15 @@ def classify_images_batch(
         for path, verdict in zip(batch, parsed):
             verdicts[path] = verdict
             _cache_put(path, video_subject, verdict)
-            if verdict == VERDICT_WATERMARK:
-                logger.info(
-                    f"visual_gate: rejected for watermark/branding: "
-                    f"{os.path.basename(path)}"
-                )
-            elif verdict == VERDICT_GENERIC:
-                logger.info(
-                    f"visual_gate: rejected as generic/collage: {os.path.basename(path)}"
-                )
-            elif verdict == VERDICT_UNRELATED:
-                logger.info(
-                    f"visual_gate: rejected as unrelated to '{video_subject}': "
-                    f"{os.path.basename(path)}"
-                )
+            _label = {
+                VERDICT_WATERMARK: "watermark/branding",
+                VERDICT_POSTER: "poster/promotional art",
+                VERDICT_COLLAGE: "collage/grid",
+                VERDICT_GENERIC: "generic filler",
+                VERDICT_UNRELATED: f"unrelated to '{video_subject}'",
+            }.get(verdict)
+            if _label:
+                logger.info(f"visual_gate: {_label}: {os.path.basename(path)}")
 
     return verdicts
 
