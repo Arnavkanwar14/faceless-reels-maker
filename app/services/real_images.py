@@ -56,7 +56,10 @@ _MAX_ASPECT_RATIO = 2.5  # long_side / short_side above this gets rejected
 _IMAGES_PER_TERM = 2
 # 候选池要比实际需要的张数多几倍，择优才有意义：过完清晰度、水印、拼图
 # 几道闸之后能留下的通常只是少数，池子太浅就退化回"有什么用什么"。
-_POOL_OVERSAMPLE = 4
+#
+# 取 6 倍：漫画/宣传类主题的拒绝率很高（大量海报、拼图页），池子够深，OK 和
+# COLLAGE 两档才更容易把镜头数堆到 70% 底线，用不着动到 GENERIC 兜底。
+_POOL_OVERSAMPLE = 6
 # 素材不足需要拉长单张时长时的上限。设成 15s 是为了让常见的"薄素材"情况
 # 正好一遍铺满、完全不循环——比如 3 张图铺 45 秒，每张 15 秒刚好覆盖，不会
 # 出现"同样三张每 15 秒重来一次"。再长会让单张静态图停留过久显得拖沓，所以
@@ -206,7 +209,7 @@ def _ddgs_image_candidates(search_term: str, video_subject: str) -> List[str]:
     for query in queries:
         try:
             with DDGS() as ddgs:
-                for r in ddgs.images(query, max_results=20, size="Large"):
+                for r in ddgs.images(query, max_results=30, size="Large"):
                     url = r.get("image")
                     if url and url not in seen_urls:
                         seen_urls.add(url)
