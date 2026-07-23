@@ -27,15 +27,23 @@ _POLLINATIONS_TIMEOUT = 60
 # 每种运镜方式给出独立的 zoompan 表达式：缩放边界固定裁到目标画幅
 # （见 image_to_ken_burns_clip 的 scale+crop 步骤），这里只负责起止焦距
 # 和推进方向，让多张静态图连续出现时不会每张都是同一个运镜观感。
+#
+# 关键：推进速度按总帧数算，而不是写死每帧增量。写死增量的话，运镜会在
+# 固定帧数内走完然后卡住不动——5s 的片段刚好，但素材不够、需要把每张图
+# 拉长到 15s 铺满时间线时，就变成"动 4 秒、静止 11 秒"。用 {zstep}/{xstep}
+# 让整个推进正好铺满整个片段，多长的片段都是一路匀速在动。
+_KEN_BURNS_TOTAL_ZOOM = 0.12  # 全程缩放幅度：1.0 -> 1.12
+_KEN_BURNS_PAN_ZOOM = 1.08    # 平移时保持的固定焦距
+
 _KEN_BURNS_STYLES = (
     # zoom in, centered
-    "zoompan=z='min(zoom+0.0008,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
+    "zoompan=z='min(zoom+{zstep},1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
     # zoom out, centered
-    "zoompan=z='if(eq(on,0),1.1,max(zoom-0.0008,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
+    "zoompan=z='if(eq(on,0),1.12,max(zoom-{zstep},1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
     # slow pan left -> right while holding zoom steady
-    "zoompan=z='1.08':x='if(eq(on,0),0,x+1.2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
+    "zoompan=z='1.08':x='if(eq(on,0),0,x+{xstep})':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
     # slow pan right -> left while holding zoom steady
-    "zoompan=z='1.08':x='if(eq(on,0),iw-iw/zoom,x-1.2)':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
+    "zoompan=z='1.08':x='if(eq(on,0),iw-iw/zoom,x-{xstep})':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
 )
 
 
@@ -102,12 +110,20 @@ def image_to_ken_burns_clip(
     """
     ffmpeg_binary = utils.get_ffmpeg_binary()
     fps = 30
-    total_frames = duration * fps
+    total_frames = max(1, duration * fps)
     # 先裁到目标画幅，再放大到 1.15 倍留出推进余量，避免 zoompan 边缘黑边。
     zoom_w, zoom_h = int(width * 1.15), int(height * 1.15)
 
+    # 把整段推进按总帧数摊开：缩放在整段里从 1.0 匀速走到 1.12；平移的每帧
+    # 步长用 ffmpeg 变量表达（iw、zoom 在渲染时才知道具体值），让平移正好在
+    # 片段结束时走到画面另一端。这样 5s 和 15s 的片段都是一路匀速在动，不会
+    # 出现"前几秒动、后面卡住"。
+    zstep = _KEN_BURNS_TOTAL_ZOOM / total_frames
+    xstep = f"(iw-iw/{_KEN_BURNS_PAN_ZOOM})/{total_frames}"
+
     zoompan_expr = random.choice(_KEN_BURNS_STYLES).format(
-        frames=total_frames, w=width, h=height, fps=fps
+        frames=total_frames, w=width, h=height, fps=fps,
+        zstep=f"{zstep:.6f}", xstep=xstep,
     )
 
     if _aspect_mismatch_ratio(image_path, width, height) <= _MAX_CROP_ASPECT_MISMATCH:

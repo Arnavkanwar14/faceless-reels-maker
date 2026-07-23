@@ -56,6 +56,12 @@ _IMAGES_PER_TERM = 2
 # 候选池要比实际需要的张数多几倍，择优才有意义：过完清晰度、水印、拼图
 # 几道闸之后能留下的通常只是少数，池子太浅就退化回"有什么用什么"。
 _POOL_OVERSAMPLE = 4
+# 素材不足需要拉长单张时长时的上限。设成 15s 是为了让常见的"薄素材"情况
+# 正好一遍铺满、完全不循环——比如 3 张图铺 45 秒，每张 15 秒刚好覆盖，不会
+# 出现"同样三张每 15 秒重来一次"。再长会让单张静态图停留过久显得拖沓，所以
+# 到此为止；真的只有一两张时，剩下的时间仍需少量循环，但每次停留够长，
+# 观感远好于短片段快速循环。
+_MAX_STRETCHED_CLIP_DURATION = 15
 # 感知哈希汉明距离阈值，超过这个距离才算不同的画面。海报类素材被各站转载后
 # 往往只有轻微的压缩/裁切差异，阈值太小会漏判成"不同的图"。
 _DUPLICATE_HAMMING_THRESHOLD = 6
@@ -161,6 +167,12 @@ def _ddgs_image_candidates(search_term: str, video_subject: str) -> List[str]:
         f"{video_subject} gameplay screenshot"
         if "game" in video_subject.lower()
         else f"{video_subject} scene still",
+        # 多几个角度是为了保证有足够多"看得出区别"的候选进池子——层层过滤
+        # （海报/拼图/水印/清晰度）会筛掉一大半，问法太少就容易只剩三五张、
+        # 最后在成片里循环。这些角度偏向真实画面而不是宣传图。
+        f"{video_subject} still frame",
+        f"{video_subject} close up",
+        f"{video_subject} action scene",
     ]
 
     results = []
@@ -592,13 +604,33 @@ def download_real_image_clips(
     )
 
     # ---- 4. 择优渲染 ----
+    #
+    # 图片没凑够铺满时间线的张数时，把每张的时长拉长，让它们一遍就铺满整段
+    # 旁白，而不是回落到"同样几张短片段来回循环"。三张图 45 秒，与其切成
+    # 3×5s 再循环三遍（观众看到的就是每 15 秒同样三张重来一次），不如每张
+    # 15 秒放一遍——Ken Burns 现在按时长匀速推进，长片段也一路在动。时长
+    # 设了上限，避免真的只有一两张时把单张停留拉到夸张的地步。
+    per_clip_duration = max_clip_duration
+    if usable and audio_duration > 0 and len(usable) < needed:
+        spread = -(-int(audio_duration) // len(usable))  # ceil
+        per_clip_duration = min(_MAX_STRETCHED_CLIP_DURATION, max(max_clip_duration, spread))
+        if per_clip_duration > max_clip_duration:
+            logger.info(
+                f"real_images: only {len(usable)} distinct image(s) for a "
+                f"{audio_duration:.0f}s video - stretching each to "
+                f"{per_clip_duration}s so they fill the timeline once instead "
+                "of looping"
+            )
+
     video_paths = []
     for image_path in usable:
         if len(video_paths) >= needed:
             break
 
         frame_hash = utils.md5(image_path)
-        clip_path = os.path.join(output_dir, f"realimg-{task_id}-{frame_hash}.mp4")
+        clip_path = os.path.join(
+            output_dir, f"realimg-{task_id}-{frame_hash}-{per_clip_duration}.mp4"
+        )
         if os.path.exists(clip_path) and os.path.getsize(clip_path) > 0:
             video_paths.append(clip_path)
             continue
@@ -620,7 +652,7 @@ def download_real_image_clips(
             continue
 
         if ai_visuals.image_to_ken_burns_clip(
-            upscaled_path, clip_path, max_clip_duration, width, height
+            upscaled_path, clip_path, per_clip_duration, width, height
         ):
             video_paths.append(clip_path)
             logger.info(
