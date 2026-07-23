@@ -96,6 +96,77 @@ def _extract_frame_base64(video_path: str, timestamp: float = 1.0) -> str | None
                 pass
 
 
+# 视觉判定结果的磁盘缓存。
+#
+# 迭代调参时同一个主题会反复重跑，每次都对着相同的图重新问一遍视觉模型，
+# 很快就把免费额度耗光；额度一旦被限流，strict 模式会把没核实成的图整批
+# 丢掉，可用素材数就从 9 张塌成 3 张——同样的代码、同样的主题，结果却时好
+# 时坏，全看当时的额度状态。判定在 temperature=0 下本来就是确定性的，缓存
+# 下来重复使用既不影响正确性，又能把额度压力从"每次重跑"降到"每张图一辈子
+# 一次"。
+_VERDICT_CACHE: dict[str, str] | None = None
+
+
+def _cache_path() -> str:
+    return os.path.join(utils.storage_dir("cache_videos", create=True), "vision_verdicts.json")
+
+
+def _load_cache() -> dict[str, str]:
+    global _VERDICT_CACHE
+    if _VERDICT_CACHE is None:
+        try:
+            import json
+
+            with open(_cache_path(), "r", encoding="utf-8") as f:
+                _VERDICT_CACHE = json.load(f)
+        except Exception:
+            _VERDICT_CACHE = {}
+    return _VERDICT_CACHE
+
+
+def _cache_key(image_path: str, video_subject: str) -> str | None:
+    """按图片内容 + 主题生成缓存键。用文件内容哈希而不是路径——同一张图在
+    不同任务里文件名不同，按内容才能真正命中。"""
+    import hashlib
+
+    try:
+        with open(image_path, "rb") as f:
+            content = f.read()
+    except OSError:
+        return None
+    digest = hashlib.md5()
+    digest.update(content)
+    digest.update(video_subject.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _cache_get(image_path: str, video_subject: str) -> str | None:
+    key = _cache_key(image_path, video_subject)
+    if key is None:
+        return None
+    verdict = _load_cache().get(key)
+    # UNKNOWN 表示"当时没检查成"，不该被缓存成永久结论——否则一次限流就把
+    # 这张图永久钉死成"没核实"。只缓存真正的判定结果。
+    return verdict if verdict in (VERDICT_OK, VERDICT_WATERMARK, VERDICT_GENERIC, VERDICT_UNRELATED) else None
+
+
+def _cache_put(image_path: str, video_subject: str, verdict: str) -> None:
+    if verdict not in (VERDICT_OK, VERDICT_WATERMARK, VERDICT_GENERIC, VERDICT_UNRELATED):
+        return
+    key = _cache_key(image_path, video_subject)
+    if key is None:
+        return
+    cache = _load_cache()
+    cache[key] = verdict
+    try:
+        import json
+
+        with open(_cache_path(), "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except Exception as e:
+        logger.debug(f"visual_gate: failed to persist verdict cache: {e}")
+
+
 def _build_prompt(video_subject: str) -> str:
     return (
         "This image was selected as visual material for "
@@ -316,12 +387,29 @@ def classify_images_batch(
     if not providers_available:
         return {path: VERDICT_UNKNOWN for path in image_paths}
 
-    for start in range(0, len(image_paths), _BATCH_SIZE):
-        batch = image_paths[start : start + _BATCH_SIZE]
+    # 先吃缓存：之前判定过的图直接复用，只对没见过的图去问模型。这样重复
+    # 重跑不会反复消耗额度，可用素材数也就不会因为限流而忽多忽少。
+    to_check = []
+    for path in image_paths:
+        cached = _cache_get(path, video_subject)
+        if cached is not None:
+            verdicts[path] = cached
+        else:
+            to_check.append(path)
+
+    if verdicts:
+        logger.info(
+            f"visual_gate: reused {len(verdicts)} cached verdict(s), "
+            f"checking {len(to_check)} new image(s)"
+        )
+
+    for start in range(0, len(to_check), _BATCH_SIZE):
+        batch = to_check[start : start + _BATCH_SIZE]
         data_uris = [_encode_image_file(p) for p in batch]
         if any(uri is None for uri in data_uris):
             for path in batch:
                 verdicts[path] = classify_image(path, video_subject)
+                _cache_put(path, video_subject, verdicts[path])
             continue
 
         content: List[dict] = [
@@ -338,10 +426,12 @@ def classify_images_batch(
             )
             for path in batch:
                 verdicts[path] = classify_image(path, video_subject)
+                _cache_put(path, video_subject, verdicts[path])
             continue
 
         for path, verdict in zip(batch, parsed):
             verdicts[path] = verdict
+            _cache_put(path, video_subject, verdict)
             if verdict == VERDICT_WATERMARK:
                 logger.info(
                     f"visual_gate: rejected for watermark/branding: "
