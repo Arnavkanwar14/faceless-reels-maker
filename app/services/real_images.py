@@ -69,6 +69,12 @@ _MAX_STRETCHED_CLIP_DURATION = 15
 # 覆盖率底线：最终不同镜头（按基础片段时长算）至少要覆盖这么多比例的旁白，
 # 否则从 COLLAGE、再到 GENERIC 逐级往回捞，直到够线或候选用尽。
 _COVERAGE_FLOOR = 0.7
+
+# 是否在成片里穿插真实动态片段（从 YouTube 相关视频里切出来的短片段）。
+# 当前关闭：对漫画/角色类主题，这些片段基本都是低清粉丝剪辑，下载完又被
+# 清晰度门拒掉，只是白白拖慢流水线。逻辑整套保留，将来针对有高清素材的
+# 主题想启用时改成 True 即可。
+_USE_MOTION_CLIPS = False
 # 感知哈希汉明距离阈值，超过这个距离才算不同的画面。海报类素材被各站转载后
 # 往往只有轻微的压缩/裁切差异，阈值太小会漏判成"不同的图"。
 _DUPLICATE_HAMMING_THRESHOLD = 6
@@ -522,28 +528,33 @@ def download_real_image_clips(
 
     needed = max(1, int(audio_duration / max_clip_duration + 0.999)) if audio_duration else 1
 
-    # ---- 0. 真实动态片段优先 ----
+    # ---- 0. 真实动态片段优先（当前默认关闭） ----
     #
-    # 静态图配 Ken Burns 推镜说到底是在模拟运动，真实素材本身的运动永远更好
-    # 看。而且对还没上映的电影/还没发售的游戏这类主题，网上能搜到的图基本
-    # 全是海报和同人图——真正的画面只存在于预告片里，网页图片搜索这条路
-    # 天然拿不到。下载片段本来就是抽帧要做的事，顺手切成动态片段几乎零成本。
-    motion_clips = _collect_motion_clips(
-        search_terms, video_subject, output_dir, needed, max_clip_duration
-    )
-    if len(motion_clips) >= needed:
-        logger.success(
-            f"real_images: using {len(motion_clips)} real motion clips "
-            "(better than stills, no Ken Burns needed)"
+    # 静态图配 Ken Burns 推镜说到底是在模拟运动，真实素材本身的运动更好看，
+    # 所以这条路是有价值的、要留着。但对漫画/角色这类主题，YouTube 上能搜到
+    # 的基本是低清粉丝剪辑，拉下来的片段过不了清晰度门，最后全被丢掉——白白
+    # 花掉每条视频约 95s 的区间下载时间，成片却一帧动态素材都没用上。
+    #
+    # 所以现在默认跳过这一步：成片纯用网页图片 + Ken Burns，省掉那段无用的
+    # 下载等待。整套动态片段的逻辑原样保留，将来想用（比如确实有高清预告片的
+    # 主题）把 _USE_MOTION_CLIPS 改成 True 即可，不用重写。
+    motion_clips: List[str] = []
+    if _USE_MOTION_CLIPS:
+        motion_clips = _collect_motion_clips(
+            search_terms, video_subject, output_dir, needed, max_clip_duration
         )
-        return motion_clips[:needed]
+        if len(motion_clips) >= needed:
+            logger.success(
+                f"real_images: using {len(motion_clips)} real motion clips "
+                "(better than stills, no Ken Burns needed)"
+            )
+            return motion_clips[:needed]
 
-    still_slots_needed = needed - len(motion_clips)
-    if motion_clips:
-        logger.info(
-            f"real_images: got {len(motion_clips)} motion clip(s), filling the "
-            f"remaining {still_slots_needed} slot(s) with stills"
-        )
+        if motion_clips:
+            logger.info(
+                f"real_images: got {len(motion_clips)} motion clip(s), filling "
+                f"the remaining {needed - len(motion_clips)} slot(s) with stills"
+            )
 
     # ---- 1. 汇集候选：两个来源都收，不再是"截图不够才去搜图" ----
     pool: List[tuple[str, str]] = []
