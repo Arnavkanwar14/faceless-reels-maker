@@ -79,6 +79,41 @@ def _blur_variance(image: Image.Image) -> float:
     return float(np.asarray(edges, dtype=np.float32).var())
 
 
+def salient_focus(image: Image.Image) -> tuple[float, float]:
+    """估计画面主体的焦点位置，返回归一化坐标 (fx, fy)，范围都是 [0,1]。
+
+    用途：裁切/运镜时把窗口对准主体，而不是闭着眼睛裁正中间——正中间裁法
+    最常见的翻车就是把人物的头裁掉（头一般在竖图偏上的位置）。
+
+    原理：人脸和主体细节（五官、边缘）的边缘响应远高于天空、纯色背景这类
+    区域，所以边缘能量的重心通常就落在主体上。纯 Pillow+numpy，无需人脸
+    检测模型或额外依赖。
+
+    再叠加一点"上偏"先验：同等条件下主体（尤其是头部）更可能在画面上半部，
+    给上半部一点额外权重，让焦点更稳地压在头/脸而不是躯干。
+    """
+    try:
+        # 缩到小图算，既快又能抹掉高频噪声对重心的干扰。
+        small = image.convert("L").resize((64, 64))
+        edges = np.asarray(small.filter(ImageFilter.FIND_EDGES), dtype=np.float32)
+    except Exception:
+        return 0.5, 0.5
+
+    total = float(edges.sum())
+    if total <= 0:
+        return 0.5, 0.5
+
+    ys, xs = np.mgrid[0:edges.shape[0], 0:edges.shape[1]]
+    # 上偏先验：从上到下权重 1.15 -> 0.85，轻微把重心往上拉。
+    row_bias = np.linspace(1.15, 0.85, edges.shape[0]).reshape(-1, 1)
+    weighted = edges * row_bias
+    wtotal = float(weighted.sum()) or total
+
+    fx = float((weighted * xs).sum() / wtotal) / (edges.shape[1] - 1)
+    fy = float((weighted * ys).sum() / wtotal) / (edges.shape[0] - 1)
+    return min(max(fx, 0.0), 1.0), min(max(fy, 0.0), 1.0)
+
+
 def _average_hash(image: Image.Image, hash_size: int = _HASH_SIZE) -> str:
     small = image.convert("L").resize((hash_size, hash_size))
     pixels = np.asarray(small, dtype=np.float32)

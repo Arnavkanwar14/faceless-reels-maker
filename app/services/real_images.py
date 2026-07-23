@@ -114,22 +114,44 @@ def _is_blocked_source(*fields: str) -> bool:
 # 注意这一手只对"贴边"的水印有效。压在画面正中的大标题字幕（新闻/博客做的
 # 文章头图常见）裁不掉，那种只能靠 visual_gate 看图判断。
 _BORDER_CROP_RATIO = 0.15
+# 无论主体在哪，每条边至少裁掉这么多——保证常见的角标/信箱黑边始终被削掉，
+# 即便裁切窗口为了保住主体而贴到了某条边。
+_BORDER_CROP_MIN_MARGIN = 0.04
 
 
 def crop_borders(image_path: str, ratio: float = _BORDER_CROP_RATIO) -> str:
-    """把图片四周各裁掉 ratio 比例的一圈，就地覆盖原文件。
+    """裁掉四周一圈以去除角标/黑边，但裁切窗口对准主体而不是死板地取正中。
 
-    裁完仍然保持原始宽高比，所以不会影响后续 Ken Burns 的构图逻辑。
+    原来是四周各裁固定 15%，正中不动——竖图里人物的头通常就在顶部那 15% 里，
+    于是"去水印"顺手把头也裁没了。现在先用边缘能量估出主体焦点，再把（尺寸
+    不变的）裁切窗口滑动到对准焦点，同时保证每条边至少还裁掉
+    _BORDER_CROP_MIN_MARGIN，这样既保住主体，又不至于漏掉贴边的角标。
+
     任何失败都返回原路径，不影响流水线继续。
     """
     try:
         with Image.open(image_path) as img:
             img = img.convert("RGB")
             width, height = img.size
-            dx, dy = int(width * ratio), int(height * ratio)
-            if width - 2 * dx < 100 or height - 2 * dy < 100:
+
+            win_w = int(width * (1 - 2 * ratio))
+            win_h = int(height * (1 - 2 * ratio))
+            if win_w < 100 or win_h < 100:
                 return image_path
-            cropped = img.crop((dx, dy, width - dx, height - dy))
+
+            fx, fy = quality_gate.salient_focus(img)
+
+            # 理想位置：让焦点落在裁切窗口正中。
+            left = int(fx * width - win_w / 2)
+            top = int(fy * height - win_h / 2)
+
+            # 但每条边至少保留 min_margin 的裁切量，所以窗口不能一路贴到图像边缘。
+            min_mx = int(width * _BORDER_CROP_MIN_MARGIN)
+            min_my = int(height * _BORDER_CROP_MIN_MARGIN)
+            left = min(max(left, min_mx), width - win_w - min_mx)
+            top = min(max(top, min_my), height - win_h - min_my)
+
+            cropped = img.crop((left, top, left + win_w, top + win_h))
         cropped.save(image_path)
     except Exception as e:
         logger.debug(f"real_images: border crop failed for '{image_path}': {e}")

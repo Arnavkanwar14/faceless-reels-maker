@@ -46,6 +46,10 @@ _KEN_BURNS_STYLES = (
     "zoompan=z='1.08':x='if(eq(on,0),iw-iw/zoom,x-{xstep})':y='ih/2-(ih/zoom/2)':d={frames}:s={w}x{h}:fps={fps}",
 )
 
+# 只缩不移的运镜。主体偏离画面中心时用这一组：平移会把主体推出画外，纯缩放
+# 始终围绕画面中心推进，主体一直留在框内。
+_KEN_BURNS_ZOOM_STYLES = (_KEN_BURNS_STYLES[0], _KEN_BURNS_STYLES[1])
+
 
 def _generate_image(
     prompt: str, width: int, height: int, output_path: str, enhance: bool = True
@@ -121,15 +125,36 @@ def image_to_ken_burns_clip(
     zstep = _KEN_BURNS_TOTAL_ZOOM / total_frames
     xstep = f"(iw-iw/{_KEN_BURNS_PAN_ZOOM})/{total_frames}"
 
-    zoompan_expr = random.choice(_KEN_BURNS_STYLES).format(
+    # 估计主体焦点，用来决定裁切窗口的位置和运镜方式。读图失败时退回正中。
+    fx, fy = 0.5, 0.5
+    try:
+        from PIL import Image
+
+        from app.services import quality_gate
+
+        with Image.open(image_path) as _img:
+            fx, fy = quality_gate.salient_focus(_img)
+    except Exception:
+        pass
+
+    # 主体明显偏离画面中心时，平移运镜有可能在推进过程中把主体推出画外；
+    # 这种情况改用居中缩放（zoom in/out），只缩不移，主体始终在框内。主体
+    # 大致居中时才允许用平移，增加镜头语言的多样性。
+    off_center = abs(fx - 0.5) > 0.18 or abs(fy - 0.5) > 0.18
+    style_pool = _KEN_BURNS_ZOOM_STYLES if off_center else _KEN_BURNS_STYLES
+    zoompan_expr = random.choice(style_pool).format(
         frames=total_frames, w=width, h=height, fps=fps,
         zstep=f"{zstep:.6f}", xstep=xstep,
     )
 
     if _aspect_mismatch_ratio(image_path, width, height) <= _MAX_CROP_ASPECT_MISMATCH:
+        # 填满式裁切：把裁切窗口对准主体焦点，而不是死板取正中。in_w/in_h 是
+        # 缩放后（crop 的输入）尺寸，(in_w-W) 是水平方向多出来、要被裁掉的量，
+        # 乘 fx 决定往哪边裁——fx=0.5 等于居中，fx 偏小则保留左侧/顶部，主体
+        # （尤其是头部）不会被切掉。
         filter_complex = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},"
+            f"crop={width}:{height}:(in_w-{width})*{fx:.3f}:(in_h-{height})*{fy:.3f},"
             f"scale={zoom_w}:{zoom_h},"
             f"{zoompan_expr},"
             "format=yuv420p"
