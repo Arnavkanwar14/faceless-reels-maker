@@ -37,7 +37,7 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
-from app.services import cache_manager, llm, video, voice
+from app.services import cache_manager, llm, remix_bgm, video, voice
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import utils
@@ -707,7 +707,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                 row_cols[3].write(f"{task['progress']}%")
 
                 action_cols = row_cols[4].columns(
-                    4,
+                    5,
                     vertical_alignment="center",
                     gap="small",
                 )
@@ -747,6 +747,39 @@ def _render_task_table(filtered_tasks, key_prefix):
                         _queue_task_restore(task_id)
 
                 with action_cols[3]:
+                    # 背景音乐太吵时不必重跑整条流水线：旁白和音乐还在磁盘上
+                    # 是分开的文件，重新混一次音轨再换上去就行，画面直接流
+                    # 拷贝，几秒完成且不掉画质。
+                    remix_label = tr("Adjust Music Volume")
+                    with st.popover(
+                        remix_label,
+                        icon=":material/volume_down:",
+                        use_container_width=True,
+                        disabled=not has_video,
+                    ):
+                        st.caption(tr("Adjust Music Volume Help"))
+                        new_volume = st.select_slider(
+                            tr("Background Music Volume"),
+                            options=[0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20, 0.30],
+                            value=0.08,
+                            format_func=lambda v: f"{int(v * 100)}%",
+                            key=f"remix_vol_{key_prefix}_{task_id}",
+                        )
+                        if st.button(
+                            tr("Apply"),
+                            key=f"remix_apply_{key_prefix}_{task_id}",
+                            use_container_width=True,
+                        ):
+                            with st.spinner(tr("Adjusting Music Volume")):
+                                written = remix_bgm.remix_task_bgm(task_id, new_volume)
+                            if written:
+                                st.success(
+                                    f"{tr('Saved As')}: {os.path.basename(written[0])}"
+                                )
+                            else:
+                                st.error(tr("Adjust Music Volume Failed"))
+
+                with action_cols[4]:
                     delete_label = tr("Delete Task")
                     delete_help = (
                         f"{delete_label} ({tr('Task Status Processing')})"
