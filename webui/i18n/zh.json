@@ -272,10 +272,11 @@
     "llm_provider_tips.pollinations": "##### Pollinations AI 配置说明\n- **API Key**: 在 [Pollinations]({api_key_url}) 创建\n- **Base Url**: 默认 `{default_base_url}`\n- **Model Name**: 默认 `{default_model}`；也可以填写 [模型目录](https://gen.pollinations.ai/v1/models) 中支持 Chat Completions 的其它模型 ID",
     "llm_provider_tips.litellm": "##### LiteLLM 配置说明\n- **API Key**: 无需在此处填写；请通过环境变量配置目标 Provider 的密钥\n- **Base Url**: 无需填写\n- **Model Name**: 默认 `{default_model}`；使用 `provider/model` 格式，[查看 Provider 列表](https://docs.litellm.ai/docs/providers)",
     "Adjust Music Volume": "调整背景音乐音量",
-    "Adjust Music Volume Help": "按新的音量重新混合这条成片的背景音乐。画面直接复制不重新编码，几秒完成且不掉画质。结果另存为新文件，原文件保留。",
+    "Adjust Music Volume Help": "按新的音量重新混合背景音乐，并就地替换成片文件。画面直接复制不重新编码，几秒完成且不掉画质。之后随时可以再调。",
     "Adjusting Music Volume": "正在重新混音...",
     "Adjust Music Volume Failed": "重新混音失败。需要任务目录里仍保留旁白音频（audio.mp3）和背景音乐文件。",
     "Apply": "应用",
-    "Saved As": "已保存为"
+    "Saved As": "已保存为",
+    "Music Volume Updated": "背景音乐音量已更新，成片文件已就地替换。"
   }
 }

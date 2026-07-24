@@ -2,12 +2,13 @@
 
 Command-line front end for app.services.remix_bgm - see that module for why
 this beats regenerating the whole video. The picture is stream-copied, so it
-finishes in seconds with no quality loss and the original file is left alone.
+finishes in seconds with no quality loss.
 
     python scripts/fix_bgm_volume.py <task_id> 0.08
     python scripts/fix_bgm_volume.py <task_id> 0.08 --bgm "path/to/song.mp3"
 
-Writes <video>-quietbgm.mp4 next to the original.
+Replaces the video file(s) in place - run it again with a different volume
+to re-adjust; there is no separate copy to clean up.
 """
 
 from __future__ import annotations
@@ -30,11 +31,11 @@ def main(argv: list[str]) -> int:
 
     written = remix_bgm.remix_task_bgm(task_id, volume, bgm_override)
     if not written:
-        print("nothing was written - see the log above for the reason")
+        print("nothing was updated - see the log above for the reason")
         return 1
 
     for path in written:
-        print(f"wrote {path}")
+        print(f"updated {path}")
     return 0
 
 

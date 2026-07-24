@@ -773,9 +773,10 @@ def _render_task_table(filtered_tasks, key_prefix):
                             with st.spinner(tr("Adjusting Music Volume")):
                                 written = remix_bgm.remix_task_bgm(task_id, new_volume)
                             if written:
-                                st.success(
-                                    f"{tr('Saved As')}: {os.path.basename(written[0])}"
-                                )
+                                st.success(tr("Music Volume Updated"))
+                                # 文件已就地替换，刷新一次让列表和播放按钮
+                                # 指向新内容，避免界面还拿着上一次的状态。
+                                st.rerun()
                             else:
                                 st.error(tr("Adjust Music Volume Failed"))
 

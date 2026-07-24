@@ -24,9 +24,16 @@ from loguru import logger
 from app.services import video as video_service
 from app.utils import utils
 
-# 输出文件的后缀。也用来把本模块自己的产物排除在输入之外，否则重复调用会对着
-# 上一次的结果再混一遍，堆出 -quietbgm-quietbgm 这种层层叠加的文件。
-OUTPUT_SUFFIX = "-quietbgm"
+# 结果直接覆盖原成片，而不是另存一份。
+#
+# 另存新文件看着更安全，实际很难用：界面上的播放按钮认的是原来的文件名，调完
+# 音量一点播放放的还是旧的那条，会以为没生效；而且每调一次就多留一份几十 MB
+# 的副本堆在任务目录里。
+#
+# 覆盖是安全的：重混每次都是拿 audio.mp3（旁白）和音乐原文件重新合成音轨，
+# 从来不依赖成片里已有的那条音轨，画面则是流拷贝。所以同一条片子可以反复
+# 按不同音量重混，既不会有代际画质损失，也永远能再调回去。
+_TEMP_SUFFIX = ".remix-tmp.mp4"
 
 
 def _narration_duration(path: str) -> float:
@@ -40,11 +47,11 @@ def _narration_duration(path: str) -> float:
 
 
 def find_source_videos(task_dir: str) -> List[str]:
-    """任务目录里可以重新混音的成片（排除本模块自己的输出）。"""
+    """任务目录里可以重新混音的成片。"""
     return sorted(
         p
         for p in glob.glob(os.path.join(task_dir, "final-*.mp4"))
-        if OUTPUT_SUFFIX not in os.path.basename(p)
+        if not p.endswith(_TEMP_SUFFIX)
     )
 
 
@@ -92,7 +99,9 @@ def remix_task_bgm(
     ffmpeg = utils.get_ffmpeg_binary()
     written: List[str] = []
     for src in videos:
-        out = src.replace(".mp4", f"{OUTPUT_SUFFIX}.mp4")
+        # 先写到临时文件，成功了再替换原片：ffmpeg 不能原地读写同一个文件，
+        # 中途失败时原片也不会被写坏。
+        tmp = src + _TEMP_SUFFIX
         cmd = [
             ffmpeg, "-y",
             "-i", src,
@@ -104,13 +113,14 @@ def remix_task_bgm(
             # 指定，免得替换完音轨反而把声道数/采样率改掉。
             "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
             "-shortest",
-            out,
+            tmp,
         ]
         try:
             result = subprocess.run(cmd, capture_output=True, timeout=300)
-            if result.returncode == 0 and os.path.exists(out):
-                written.append(out)
-                logger.info(f"remix_bgm: wrote {out}")
+            if result.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                os.replace(tmp, src)  # 原子替换，不留旧副本
+                written.append(src)
+                logger.info(f"remix_bgm: updated {src} (bgm volume {bgm_volume})")
             else:
                 logger.warning(
                     f"remix_bgm: ffmpeg failed for {src}: "
@@ -118,6 +128,12 @@ def remix_task_bgm(
                 )
         except Exception as e:
             logger.warning(f"remix_bgm: failed for {src}: {e}")
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
     if os.path.exists(mixed):
         try:
